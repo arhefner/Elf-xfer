@@ -407,7 +407,7 @@ static int receive()
 
         a_chunk = (Chunk *)malloc(sizeof(Chunk));
       }
-      
+
       a_chunk->address = address;
       a_chunk->size = count;
     }
@@ -545,7 +545,7 @@ void tty_raw(void)
 
   raw = orig_termios;  /* copy original and then modify below */
 
-  /* input modes - clear indicated ones giving: no break, no CR to NL, 
+  /* input modes - clear indicated ones giving: no break, no CR to NL,
      no parity check, no strip char, no start/stop output (sic) control */
   raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
 
@@ -555,7 +555,7 @@ void tty_raw(void)
   /* control modes - set 8 bit chars */
   raw.c_cflag |= (CS8);
 
-  /* local modes - clear giving: echoing off, canonical off (no erase with 
+  /* local modes - clear giving: echoing off, canonical off (no erase with
      backspace, ^U,...),  no extended functions, no signal chars (^Z,^C) */
   raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
 
@@ -592,10 +592,10 @@ int main(int argc, char **argv)
       case 'v':
         verbose++;
         break;
-      case '?': 
+      case '?':
         fprintf(stderr, "Unknown option: %c\n", optopt);
         usage();
-        break;     
+        break;
       default:
         usage();
         break;
