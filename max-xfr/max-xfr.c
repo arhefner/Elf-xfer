@@ -436,6 +436,13 @@ static int receive()
   return 0;
 }
 
+static int is_hex(const char *file)
+{
+  const char *ext = get_file_extension(file);
+
+  return ((strcmp(ext, ".hex") == 0) || (strcmp(ext, ".intel") == 0));
+}
+
 /*
  *	Send a file in MAX mode.
  */
@@ -443,7 +450,7 @@ static int msend(const char *file)
 {
   int ret;
 
-  if (strcmp(get_file_extension(file), ".hex") == 0)
+  if (is_hex(file))
   {
     ret = read_hex(file);
   }
@@ -471,7 +478,7 @@ static int mrecv(const char *file)
 
   if (ret == 0)
   {
-    if (strcmp(get_file_extension(file), ".hex") == 0)
+    if (is_hex(file))
     {
       ret = write_hex(file);
     }
