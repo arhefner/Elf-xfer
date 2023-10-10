@@ -1,0 +1,9 @@
+.vscode
+*.prg
+*.build
+*.lst
+*.hex
+*.elfos
+*.o
+max-xfr
+
