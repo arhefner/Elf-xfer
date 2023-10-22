@@ -14,6 +14,7 @@ main:       call  f_freemem
 
             call  f_inmsg
             db    "Start send...",0
+            mov   ra,0
             call  loadbin
             bnf   success
             call  f_inmsg
@@ -28,9 +29,11 @@ exit:       mark
 
 loadbin:    ghi   r8
             stxd
-            ghi   ra
+            glo   r8
             stxd
-            glo   ra
+            ghi   r9
+            stxd
+            glo   r9
             stxd
             ghi   rc
             stxd
@@ -44,16 +47,16 @@ loadbin:    ghi   r8
 
             call  f_read
             xri   55h
-            bnz   error
+            bnz   lberror
             ldi   0aah
             call  f_type
 
-next:       call  f_read
-            bz    over
+lbnext:     call  f_read
+            bz    lbover
             call  f_type
-            
+
             smi   1
-            bnz   error
+            bnz   lberror
 
             call  f_read
             phi   rc
@@ -65,32 +68,35 @@ next:       call  f_read
             call  f_type
 
             call  f_read
-            phi   ra
+            phi   r9
             call  f_type
 
             call  f_read
-            plo   ra
+            plo   r9
+            plo   r8
+            add16 r9,ra
+            glo   r8
             call  f_type
 
 readlp:     call  f_read
 
-            str   ra
-            inc   ra
+            str   r9
+            inc   r9
 
             untl  rc,readlp
 
 ack:        ldi   0aah
             call  f_type
 
-            br    next
+            br    lbnext
 
-over:       call  f_read
+lbover:     call  f_read
             xri   'x'
-            bnz   error
+            bnz   lberror
 
-done:       clc
+lbdone:     clc
             lskp
-error:      stc
+lberror:    stc
 
             ghi   r8
             phi   re
@@ -101,9 +107,11 @@ error:      stc
             ldxa
             phi   rc
             ldxa
-            plo   ra
+            plo   r9
             ldxa
-            phi   ra
+            phi   r9
+            ldxa
+            plo   r8
             ldx
             phi   r8
 
