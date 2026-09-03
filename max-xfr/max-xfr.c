@@ -8,32 +8,50 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <getopt.h>
 #include <termios.h>
 
 #include "intl.h"
-#include "ihex.h"
-
-uint8_t memory[65536];
-
-typedef struct chunk
-{
-  uint16_t      address;
-  size_t        size;
-  struct chunk *next;
-} Chunk;
-
-Chunk *chunks = NULL;
-Chunk *tail = NULL;
 
 /*
- *	Externals.
+ * Batch-capable MAX protocol (2026-09-01): a per-file header block
+ * (name + 32-bit size) precedes each file's data, in the same spirit
+ * as YMODEM's own extension of XMODEM, but reusing the ORIGINAL
+ * single-file MAX block mechanism completely unchanged -- a header
+ * block is nothing more than an ordinary block whose payload both
+ * ends agree to interpret specially. See progs/mr.asm and progs/ms.asm
+ * (the ELF-DOS side of this protocol) for the full wire-level design
+ * writeup; this file mirrors that design exactly, just with the
+ * sender/receiver roles swapped for -s/-r respectively.
+ *
+ * The OLD single-block protocol (no header, no batch, one file per
+ * invocation) is gone -- mr.asm/ms.asm no longer speak it, so this
+ * tool can't either. This also means the old Intel-HEX (.hex/.intel)
+ * support -- which encoded a memory image as one or more separately-
+ * addressed chunks, a shape with no coherent mapping onto "one file =
+ * one name + one contiguous byte stream" -- has been dropped along
+ * with it; that mode was never meaningfully usable against mr.asm
+ * anyway, since mr.asm has always ignored the wire's own address
+ * field entirely (see mr.asm's own header comment: "the address field
+ * exists for compatibility... goes unused"). ihex.c/ihex.h are left
+ * in the repo untouched in case they're wanted for something else
+ * later; this file just no longer links against them.
+ *
+ * Streaming, not buffering: file data is now read/written directly
+ * to/from disk in BLOCK_BUF_LEN-byte chunks as it's sent/received,
+ * instead of loading a whole file into one fixed-size array first --
+ * removes the old 64KB-per-file ceiling (a real overflow risk once
+ * files could legitimately exceed that) with no behavior change for
+ * anything under it.
  */
-extern int optind;
-extern char *optarg;
+
+#define BLOCK_BUF_LEN       512
+#define MAXFER_NAME_MAX     127
+#define HOST_PATH_MAX       1024
 
 /*
- *	Global variables.
+ *	Globals.
  */
 static int verbose = 0;
 static int raw_mode = 0;
@@ -44,23 +62,6 @@ static struct termios orig_termios;  /* TERMinal I/O Structure */
 static int ttyfd = STDIN_FILENO;     /* STDIN_FILENO is 0 by default */
 
 static int delay = 130;              /* Default value for 57.6k hw UART */
-
-
-static void add_chunk(Chunk *chunk)
-{
-  chunk->next = NULL;
-
-  if (tail)
-  {
-    tail->next = chunk;
-  }
-  else
-  {
-    chunks = chunk;
-  }
-
-  tail = chunk;
-}
 
 /*
  *	Show the up/download statistics.
@@ -80,425 +81,483 @@ static void stats()
   fflush(stderr);
 }
 
-const char *get_file_extension(const char *path)
+/*
+ *	write_all: write() with retry on a short write or EINTR. Every raw
+ *	byte this protocol sends goes through here.
+ */
+static int write_all(const void *buf, size_t len)
 {
-    const char *result;
-    int i, n;
-
-    assert(path != NULL);
-    n = strlen(path);
-    i = n - 1;
-    while ((i > 0) && (path[i] != '.') && (path[i] != '/') && (path[i] != '\\')) {
-        i--;
+  const uint8_t *p = buf;
+  while (len) {
+    ssize_t ret = write(STDOUT_FILENO, p, len);
+    if (ret < 0) {
+      if (errno == EINTR) continue;
+      fprintf(stderr, _("Error while writing (errno = %d)\n"), errno);
+      return -1;
     }
-    if ((i > 0) && (i < n - 1) && (path[i] == '.') && (path[i - 1] != '/') && (path[i - 1] != '\\')) {
-        result = path + i;
-    } else {
-        result = path + n;
-    }
-    return result;
-}
-
-static int read_bin(const char *file)
-{
-  FILE *fp;
-  uint16_t address = 0;
-
-  if ((fp = fopen(file, "rb")) == NULL) {
-    perror(file);
-    return -1;
+    p += ret;
+    len -= (size_t)ret;
   }
-
-  Chunk *the_chunk = (Chunk *)malloc(sizeof(Chunk));
-  the_chunk->address = address;
-  the_chunk->next = NULL;
-
-  fseek(fp, 0L, SEEK_END);
-  the_chunk->size = ftell(fp);
-
-  fseek(fp, 0L, SEEK_SET);
-  fread(memory+address, 1, the_chunk->size, fp);
-
-  chunks = tail = the_chunk;
-
-  fclose(fp);
-
   return 0;
 }
 
-static int read_hex(const char *file)
+/*
+ *	host_basename: extract the text after the last '/' in path (or the
+ *	whole string if there is none) into buf, bounded to
+ *	MAXFER_NAME_MAX chars -- matches mr.asm/ms.asm's own identical cap
+ *	and scan logic exactly, rather than relying on a platform's own
+ *	basename() (which can modify its argument, and whose trailing-
+ *	slash/empty-result behavior isn't perfectly consistent across
+ *	implementations).
+ */
+static void host_basename(const char *path, char *buf, size_t bufcap)
 {
-  FILE *fp;
-  char line[1024];
-  int hex_addr, n, status, bytes[256];
-  int i, lineno = 1;
-  int address = 0;
-  int first = 1;
+  const char *base = path;
+  const char *p;
+  size_t len;
 
-  Chunk *the_chunk = (Chunk *)malloc(sizeof(Chunk));
-  the_chunk->address = address;
-  the_chunk->size = 0;
-  the_chunk->next = NULL;
-
-  if ((fp = fopen(file, "r")) == NULL) {
-    perror(file);
-    return -1;
+  for (p = path; *p; p++) {
+    if (*p == '/') base = p + 1;
   }
 
-  while (fgets(line, sizeof(line) - 2, fp) != NULL)
-  {
-    if (parse_hex_line(line, bytes, &hex_addr, &n, &status))
-    {
-      if (status == 0)
-      {  /* data */
-        if (hex_addr != the_chunk->address + the_chunk->size)
-        {
-          if (the_chunk->size != 0)
-          {
-            add_chunk(the_chunk);
+  len = strlen(base);
+  if (len > MAXFER_NAME_MAX) len = MAXFER_NAME_MAX;
+  if (len >= bufcap) len = bufcap - 1;
+  memcpy(buf, base, len);
+  buf[len] = 0;
+}
 
-            the_chunk = (Chunk *)malloc(sizeof(Chunk));
-            the_chunk->size = 0;
-            the_chunk->next = NULL;
-          }
+/*
+ *	send_block: send one block (header OR data -- identical wire shape
+ *	either way) via the standard echo-verified mechanism, then wait
+ *	for the final $AA ack. Matches the original single-file protocol's
+ *	own per-field echo/verify loop exactly; the address field is
+ *	always 0 now (it was only ever used to build the old chunk list
+ *	for Intel-HEX reconstruction, which is gone -- see this file's own
+ *	header comment).
+ *
+ *	Returns 0 on success, -1 on any echo/ack mismatch (fatal -- the
+ *	two ends are now out of lock-step).
+ */
+static int send_block(const uint8_t *payload, size_t len)
+{
+  uint8_t cmd[5];
+  uint8_t ack;
+  size_t i;
 
-          the_chunk->address = hex_addr;
-        }
+  cmd[0] = 0x01;
+  cmd[1] = (uint8_t)((len >> 8) & 0xff);
+  cmd[2] = (uint8_t)(len & 0xff);
+  cmd[3] = 0;
+  cmd[4] = 0;
 
-        for (int i = 0; i < n; i++)
-        {
-          memory[hex_addr + i] = bytes[i] & 0xff;
-        }
-
-        the_chunk->size += n;
-      }
-      else if (status == 1)
-      {  /* end of file */
-        add_chunk(the_chunk);
-        fclose(fp);
-        return 0;
-      }
-    }
-    else
-    {
-      fprintf(stderr, "Error parsing hex file.");
+  for (i = 0; i < sizeof(cmd); i++) {
+    if (write_all(cmd + i, 1) < 0) return -1;
+    if (read(STDIN_FILENO, &ack, 1) != 1 || ack != cmd[i]) {
+      fprintf(stderr, _("Error while writing (cmd = %02x, ack = %02x)\n"),
+        cmd[i], ack);
       return -1;
     }
   }
 
-  fclose(fp);
-  return 0;
-}
-
-static int send()
-{
-  Chunk *chunk;
-  uint8_t end = 0x00;
-  uint8_t ack = 0x55;
-  ssize_t ret;
-
-  clock_gettime(CLOCK_MONOTONIC, &start);
-
-  ret = write(STDOUT_FILENO, &ack, 1);
-  if (ret != 1) {
-    fprintf(stderr, _("Error while writing (errno = %d)\n"), errno);
-    return -1;
-  }
-
-  ack = getchar();
-
-  if (ack != 0xaa)
-  {
-    fprintf(stderr, "Invalid handshake: %02x.\n",ack);
-    return -1;
-  }
-
-  for (chunk = chunks; chunk != NULL; chunk = chunk->next)
-  {
-    uint16_t address = chunk->address;
-    size_t remaining = chunk->size;
-
-    while (remaining)
-    {
-      size_t count = (remaining > 512) ? 512 : remaining;
-      uint8_t *output = memory + address;
-      uint8_t cmd[5];
-      uint8_t ack;
-
-      cmd[0] = 0x01;
-      cmd[1] = (uint8_t)((count >> 8) & 0xff);
-      cmd[2] = (uint8_t)(count & 0xff);
-      cmd[3] = (uint8_t)((address >> 8) & 0xff);
-      cmd[4] = (uint8_t)(address & 0xff);
-
-      for (int i = 0; i < sizeof(cmd); i++)
-      {
-        write(STDOUT_FILENO, cmd+i, 1);
-        ack = getchar();
-        if (ack != *(cmd+i))
-        {
-          fprintf(stderr, "Error while writing (cmd = %02x, ack = %02x)\n",
-            *(cmd+i), ack);
-          return -1;
-        }
-      }
-
-      for (int i = 0; i < count; i++)
-      {
-        write(STDOUT_FILENO, output++, 1);
-        usleep(delay);
-      }
-
-      address += count;
-      remaining -= count;
-      bdone += count;
-
-      if (verbose)
-      {
-        stats();
-      }
-
-      ack = getchar();
-      if (ack != 0xaa)
-      {
-          fprintf(stderr, "Error in ack (ack = %02x)\n", ack);
-          return -1;
-      }
-    }
-  }
-
-  write(STDOUT_FILENO, &end, 1);
-
-  return 0;
-}
-
-static int write_bin(const char *file)
-{
-  Chunk *chunk;
-  FILE *fp;
-
-  if ((fp = fopen(file, "wb")) == NULL) {
-    perror(file);
-    return -1;
-  }
-
-  for (chunk = chunks; chunk != NULL; chunk = chunk->next)
-  {
-    fwrite(memory+chunk->address, 1, chunk->size, fp);
-  }
-
-  fclose(fp);
-
-  return 0;
-}
-
-static int write_hex(const char *file)
-{
-  Chunk *chunk;
-  FILE *fp;
-
-  if ((fp = fopen(file, "w")) == NULL) {
-    perror(file);
-    return -1;
-  }
-
-  for (chunk = chunks; chunk != NULL; chunk = chunk->next)
-  {
-    int addr = chunk->address;
-
-    for (int i = 0; i < chunk->size; i++)
-    {
-      hexout(fp, memory[addr], addr, 0);
-      addr++;
-    }
-  }
-
-  hexout(fp, 0, 0, 1);
-
-  return 0;
-}
-
-static int receive()
-{
-  Chunk *a_chunk;
-  uint8_t in;
-  uint16_t address;
-  uint16_t count;
-  uint8_t ack = 0xaa;
-  ssize_t ret;
-  ssize_t remaining;
-  uint8_t *mem;
-
-  clock_gettime(CLOCK_MONOTONIC, &start);
-
-  ret = write(STDOUT_FILENO, &ack, 1);
-  if (ret != 1) {
-    fprintf(stderr, _("Write error (errno = %d)\n"), errno);
-    return -1;
-  }
-
-  read(STDIN_FILENO, &ack, 1);
-
-  if (ack != 0x55)
-  {
-    fprintf(stderr, "Invalid handshake: %02x\n", ack);
-    return -1;
-  }
-
-  a_chunk = (Chunk *)malloc(sizeof(Chunk));
-  a_chunk->address = 0;
-  a_chunk->size = 0;
-
-  read(STDIN_FILENO, &in, 1);
-
-  while (in != 0x00)
-  {
-    if (in != 0x01)
-    {
-      fprintf(stderr, "Invalid command: %02x\n", in);
-      return -1;
-    }
-
-    write(STDOUT_FILENO, &in, 1);
-
-    read(STDIN_FILENO, &in, 1);
-
-    count = in;
-    write(STDOUT_FILENO, &in, 1);
-
-    read(STDIN_FILENO, &in, 1);
-
-    count = (count << 8) | in;
-    write(STDOUT_FILENO, &in, 1);
-
-    read(STDIN_FILENO, &in, 1);
-
-    address = in;
-    write(STDOUT_FILENO, &in, 1);
-
-    read(STDIN_FILENO, &in, 1);
-
-    address = (address << 8) | in;
-    write(STDOUT_FILENO, &in, 1);
-
-    mem = memory + address;
-    remaining = count;
-
-    while (remaining)
-    {
-      ret = read(STDIN_FILENO, mem, remaining);
-
-      if (ret < 0)
-      {
-        fprintf(stderr, _("Read error (errno = %d)\n"), errno);
-        return -1;
-      }
-      mem += ret;
-      remaining -= ret;
-    }
-
+  for (i = 0; i < len; i++) {
+    if (write_all(payload + i, 1) < 0) return -1;
     usleep(delay);
-
-    if (address != a_chunk->address + a_chunk->size)
-    {
-      if (a_chunk->size != 0)
-      {
-        add_chunk(a_chunk);
-
-        a_chunk = (Chunk *)malloc(sizeof(Chunk));
-      }
-
-      a_chunk->address = address;
-      a_chunk->size = count;
-    }
-    else
-    {
-      a_chunk->size += count;
-    }
-
-    bdone += count;
-
-    if (verbose)
-    {
-      stats();
-    }
-
-    ack = 0xaa;
-    write(STDOUT_FILENO, &ack, 1);
-
-    ret = read(STDIN_FILENO, &in, 1);
   }
 
-  add_chunk(a_chunk);
+  bdone += len;
+  if (verbose) stats();
 
-  fflush(stderr);
+  if (read(STDIN_FILENO, &ack, 1) != 1 || ack != 0xaa) {
+    fprintf(stderr, "Error in ack (ack = %02x)\n", ack);
+    return -1;
+  }
 
   return 0;
 }
 
-static int is_hex(const char *file)
+/*
+ *	send_end_marker: the un-echoed $00 command byte that ends a block
+ *	stream -- either "no more data for the file currently being sent"
+ *	(called once per file) or "no more files at all" (called once,
+ *	right after the last file, in the exact same "expecting a header
+ *	next" state every file starts in -- there is no separate empty-
+ *	name sentinel, matching mr.asm/ms.asm's own design). Its result is
+ *	deliberately unchecked, same as the original protocol's own
+ *	unconditional final write -- there's nothing more to do if this
+ *	one write fails at the very point the session is already ending.
+ */
+static void send_end_marker(void)
 {
-  const char *ext = get_file_extension(file);
-
-  return ((strcmp(ext, ".hex") == 0) || (strcmp(ext, ".intel") == 0));
+  uint8_t end = 0x00;
+  write_all(&end, 1);
 }
 
 /*
- *	Send a file in MAX mode.
+ *	recv_block: read one block's leading command byte and, if it's
+ *	$01, the rest of that block's header (count hi/lo, address hi/lo
+ *	-- echoed but otherwise unused) plus its payload. Every header
+ *	field is individually echoed back to the sender as it's read,
+ *	matching the sender's own per-field verification.
+ *
+ *	Returns 1 (command byte was $00 -- not echoed, no payload), 0 (a
+ *	real block was received: buf[0..*out_len-1] holds its payload), or
+ *	-1 (fatal: a read failed, or the command byte was neither $00 nor
+ *	$01).
  */
-static int msend(const char *file)
+static int recv_block(uint8_t *buf, size_t bufcap, size_t *out_len)
 {
-  int ret;
+  uint8_t in;
+  uint8_t b;
+  uint16_t count;
+  size_t remaining;
+  uint8_t *p;
 
-  if (is_hex(file))
-  {
-    ret = read_hex(file);
+  if (read(STDIN_FILENO, &in, 1) != 1) {
+    fprintf(stderr, _("Read error (errno = %d)\n"), errno);
+    return -1;
   }
-  else
-  {
-    ret = read_bin(file);
+  if (in == 0x00) return 1;
+  if (in != 0x01) {
+    fprintf(stderr, "Invalid command: %02x\n", in);
+    return -1;
+  }
+  write_all(&in, 1);
+
+  if (read(STDIN_FILENO, &b, 1) != 1) return -1;
+  count = (uint16_t)b << 8;
+  write_all(&b, 1);
+
+  if (read(STDIN_FILENO, &b, 1) != 1) return -1;
+  count |= b;
+  write_all(&b, 1);
+
+  if (read(STDIN_FILENO, &b, 1) != 1) return -1;   /* address hi, unused */
+  write_all(&b, 1);
+  if (read(STDIN_FILENO, &b, 1) != 1) return -1;   /* address lo, unused */
+  write_all(&b, 1);
+
+  if (count > bufcap) {
+    fprintf(stderr, "Block too large (%u bytes).\n", (unsigned)count);
+    return -1;
   }
 
-  if (ret == 0)
-  {
-    ret = send();
+  p = buf;
+  remaining = count;
+  while (remaining) {
+    ssize_t ret = read(STDIN_FILENO, p, remaining);
+    if (ret <= 0) {
+      fprintf(stderr, _("Read error (errno = %d)\n"), errno);
+      return -1;
+    }
+    p += ret;
+    remaining -= (size_t)ret;
   }
 
-  return ret;
+  bdone += count;
+  if (verbose) stats();
+
+  {
+    uint8_t ack = 0xaa;
+    write_all(&ack, 1);
+  }
+
+  *out_len = count;
+  return 0;
 }
 
 /*
- *	Receive a file in MAX mode.
+ *	send_batch: send "files" (nfiles entries) to a batch-capable
+ *	receiver (mr.asm on the ELF-DOS side, or another instance of this
+ *	same tool run with -r). See this file's own header comment for the
+ *	overall protocol shape.
+ *
+ *	Handshake timing: we send $55 immediately, unconditionally, before
+ *	looking at any file at all -- the receiver blocks passively
+ *	waiting for it with no way to know in advance whether any of our
+ *	files are even real, matching the original single-file protocol's
+ *	own identical handshake timing (and mr.asm's own header comment on
+ *	why: unlike our own deferred-until-something-real-to-send
+ *	handshake on the SENDING side in ms.asm, the RECEIVING side here
+ *	has no such option).
+ *
+ *	A local failure for one file (doesn't exist, is a directory, can't
+ *	open) prints its own message and moves on to the next file. A
+ *	wire/protocol failure, or a local read error partway through a
+ *	file whose header has already gone out, aborts the whole batch
+ *	immediately -- the receiver is either out of lock-step with us, or
+ *	already mid-file expecting data we can no longer produce, and this
+ *	protocol has no mid-file abort/resync signal (matching mr.asm/
+ *	ms.asm's own identical policy).
+ *
+ *	Returns 0 if every file was sent with no local or protocol errors,
+ *	-1 otherwise.
  */
-static int mrecv(const char *file)
+static int send_batch(char **files, int nfiles)
 {
-  int ret;
+  int i;
+  int any_ok = 0, any_err = 0, fatal = 0;
+  uint8_t ack;
+  uint8_t sync = 0x55;
 
-  ret = receive();
+  clock_gettime(CLOCK_MONOTONIC, &start);
 
-  if (ret == 0)
-  {
-    if (is_hex(file))
-    {
-      ret = write_hex(file);
+  if (write_all(&sync, 1) < 0) return -1;
+  if (read(STDIN_FILENO, &ack, 1) != 1 || ack != 0xaa) {
+    fprintf(stderr, "Invalid handshake: %02x.\n", ack);
+    return -1;
+  }
+
+  for (i = 0; i < nfiles; i++) {
+    const char *path = files[i];
+    struct stat st;
+    FILE *fp;
+    char base[MAXFER_NAME_MAX + 1];
+    uint8_t hdr[MAXFER_NAME_MAX + 5];
+    size_t namelen, hdrlen;
+    uint32_t size32;
+    uint8_t chunk[BLOCK_BUF_LEN];
+    size_t n;
+    int file_ok;
+
+    if (stat(path, &st) != 0) {
+      fprintf(stderr, "%s: %s\n", path, strerror(errno));
+      any_err++;
+      continue;
     }
-    else
-    {
-      ret = write_bin(file);
+    if (S_ISDIR(st.st_mode)) {
+      fprintf(stderr, "%s: is a directory\n", path);
+      any_err++;
+      continue;
+    }
+
+    fp = fopen(path, "rb");
+    if (!fp) {
+      fprintf(stderr, "%s: %s\n", path, strerror(errno));
+      any_err++;
+      continue;
+    }
+
+    host_basename(path, base, sizeof(base));
+    namelen = strlen(base);
+    memcpy(hdr, base, namelen);
+    hdr[namelen] = 0;
+    /* NB: size32 truncates a real file size wider than 32 bits to fit
+     * the wire's own 32-bit field, matching the width ELF-DOS's own
+     * FCB_FSIZE holds -- not expected to matter in practice. */
+    size32 = (uint32_t)st.st_size;
+    hdr[namelen + 1] = (uint8_t)((size32 >> 24) & 0xff);
+    hdr[namelen + 2] = (uint8_t)((size32 >> 16) & 0xff);
+    hdr[namelen + 3] = (uint8_t)((size32 >> 8) & 0xff);
+    hdr[namelen + 4] = (uint8_t)(size32 & 0xff);
+    hdrlen = namelen + 5;
+
+    if (verbose) {
+      fprintf(stderr, "Sending %s (%lu bytes)...\n", base,
+        (unsigned long)st.st_size);
+    }
+
+    if (send_block(hdr, hdrlen) < 0) {
+      fclose(fp);
+      fatal = 1;
+      break;
+    }
+
+    file_ok = 1;
+    while ((n = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+      if (send_block(chunk, n) < 0) {
+        file_ok = 0;
+        break;
+      }
+    }
+    if (file_ok && ferror(fp)) {
+      fprintf(stderr, "%s: read error\n", path);
+      file_ok = 0;
+    }
+    fclose(fp);
+
+    if (!file_ok) {
+      fatal = 1;
+      break;
+    }
+
+    send_end_marker();         /* end of THIS file's data -- no echo,
+                                 * no ack wait here (see mr.asm/ms.asm's
+                                 * own header comments for why: that
+                                 * only happens once, at the very end
+                                 * of the whole batch) */
+    any_ok++;
+  }
+
+  if (!fatal) {
+    send_end_marker();         /* outer "no more files" terminator */
+  }
+
+  if (verbose) {
+    fprintf(stderr, "\n%d file(s) sent", any_ok);
+    if (any_err) fprintf(stderr, ", %d failed", any_err);
+    fprintf(stderr, ".\n");
+  }
+
+  return (fatal || any_err) ? -1 : 0;
+}
+
+/*
+ *	receive_batch: receive a batch of one or more files from a
+ *	batch-capable sender (ms.asm on the ELF-DOS side, or another
+ *	instance of this same tool run with -s). See this file's own
+ *	header comment for the overall protocol shape.
+ *
+ *	dest_arg == NULL: batch mode, write each file under its own
+ *	transmitted name into the current directory.
+ *	dest_arg != NULL, dest_is_dir: batch mode into that directory.
+ *	dest_arg != NULL, !dest_is_dir: single-file mode -- dest_arg is
+ *	used verbatim as the destination for the FIRST file received,
+ *	ignoring that file's own transmitted name; any further files in
+ *	the same session are drained (read and discarded) so the session
+ *	still ends cleanly -- matches mr.asm's own identical semantics
+ *	exactly (this function is this tool's own mirror of mr_session).
+ *
+ *	Returns 0 if every file was received with no local or protocol
+ *	errors, -1 otherwise.
+ */
+static int receive_batch(const char *dest_arg, int dest_is_dir)
+{
+  uint8_t ack = 0xaa;
+  uint8_t in;
+  int expecting_header = 1;
+  int any_ok = 0, any_err = 0, fatal = 0;
+  int single_used = 0;
+  int discarding = 0;
+  FILE *out = NULL;
+  char cur_name[MAXFER_NAME_MAX + 1];
+  char destpath[HOST_PATH_MAX];
+  uint32_t cur_size;
+  uint8_t buf[BLOCK_BUF_LEN];
+
+  clock_gettime(CLOCK_MONOTONIC, &start);
+
+  if (write_all(&ack, 1) < 0) return -1;
+  if (read(STDIN_FILENO, &in, 1) != 1 || in != 0x55) {
+    fprintf(stderr, "Invalid handshake: %02x\n", in);
+    return -1;
+  }
+
+  for (;;) {
+    size_t len = 0;
+    int r = recv_block(buf, sizeof(buf), &len);
+
+    if (r < 0) { fatal = 1; break; }
+
+    if (r == 1) {
+      /* end marker */
+      if (expecting_header) break;   /* end of the whole batch */
+
+      /* end of the CURRENT file's data */
+      if (out) { fclose(out); out = NULL; any_ok++; }
+      discarding = 0;
+      expecting_header = 1;
+      continue;
+    }
+
+    /* r == 0: a real block */
+    if (expecting_header) {
+      size_t real_namelen = 0;
+      while (real_namelen < len && buf[real_namelen] != 0) real_namelen++;
+
+      if (real_namelen >= len) {
+        strcpy(cur_name, "?");
+        cur_size = 0;
+      } else {
+        size_t copy_len = real_namelen;
+        size_t size_off = real_namelen + 1;
+
+        if (copy_len > MAXFER_NAME_MAX) copy_len = MAXFER_NAME_MAX;
+        memcpy(cur_name, buf, copy_len);
+        cur_name[copy_len] = 0;
+
+        if (len - size_off >= 4) {
+          cur_size = ((uint32_t)buf[size_off] << 24) |
+                     ((uint32_t)buf[size_off + 1] << 16) |
+                     ((uint32_t)buf[size_off + 2] << 8) |
+                     (uint32_t)buf[size_off + 3];
+        } else {
+          cur_size = 0;
+        }
+      }
+
+      discarding = 0;
+
+      if (dest_arg == NULL) {
+        snprintf(destpath, sizeof(destpath), "%s", cur_name);
+      } else if (dest_is_dir) {
+        size_t dl = strlen(dest_arg);
+        if (dl > 0 && dest_arg[dl - 1] == '/') {
+          snprintf(destpath, sizeof(destpath), "%s%s", dest_arg, cur_name);
+        } else {
+          snprintf(destpath, sizeof(destpath), "%s/%s", dest_arg, cur_name);
+        }
+      } else if (!single_used) {
+        single_used = 1;
+        snprintf(destpath, sizeof(destpath), "%s", dest_arg);
+      } else {
+        discarding = 1;
+        fprintf(stderr,
+          "Ignoring additional file(s) sent by host (single-file mode).\n");
+      }
+
+      if (!discarding) {
+        out = fopen(destpath, "wb");
+        if (!out) {
+          fprintf(stderr, "Cannot create %s: %s\n", destpath,
+            strerror(errno));
+          discarding = 1;
+          any_err++;
+        } else if (verbose) {
+          fprintf(stderr, "Receiving %s (%lu bytes)...\n", destpath,
+            (unsigned long)cur_size);
+        }
+      }
+
+      expecting_header = 0;
+    } else {
+      /* data block */
+      if (!discarding && out) {
+        if (fwrite(buf, 1, len, out) != len) {
+          fprintf(stderr, "%s: write error\n", destpath);
+          fclose(out);
+          out = NULL;
+          fatal = 1;
+          break;
+        }
+      }
     }
   }
 
-  return ret;
+  if (out) fclose(out);
+
+  if (verbose) {
+    fprintf(stderr, "\n%d file(s) received", any_ok);
+    if (any_err) fprintf(stderr, ", %d failed", any_err);
+    fprintf(stderr, ".\n");
+  }
+
+  return (fatal || any_err) ? -1 : 0;
 }
 
 static void usage(void)
 {
   fprintf(stderr, "\
-Usage: max-xfr -s|-r [-v] [-d <delay>] filename\n\
-       -s:  send\n\
-       -r:  receive\n\
-       -v:  verbose (statistics on stderr output)\n\
-       -d:  delay in microseconds for send\n");
+Usage: max-xfr -s [-v] [-d <delay>] <file> [file...]\n\
+       max-xfr -r [-v] [-d <delay>] [<destination>]\n\
+       -s:  send one or more files (batch mode)\n\
+       -r:  receive whatever the sender offers, into <destination> if\n\
+            given (an existing directory selects batch mode into it;\n\
+            any other name selects single-file mode, saving only the\n\
+            first file offered), or into the current directory\n\
+            otherwise\n\
+       -v:  verbose (statistics and per-file progress on stderr)\n\
+       -d:  delay in microseconds between bytes while sending\n");
   exit(1);
 }
 
@@ -576,7 +635,6 @@ int main(int argc, char **argv)
 {
   int c;
   int what = 0;
-  char *file;
   int ret;
   uint8_t over = 'x';
 
@@ -602,9 +660,9 @@ int main(int argc, char **argv)
     }
   }
 
-  if (optind != argc - 1 || what == 0)
-    usage();
-  file = argv[optind];
+  if (what == 0) usage();
+  if (what == 's' && optind >= argc) usage();       /* need >= 1 file */
+  if (what == 'r' && argc - optind > 1) usage();     /* 0 or 1 dest */
 
   /* check that input is from a tty */
   if (! isatty(ttyfd)) fatal("not on a tty");
@@ -618,13 +676,29 @@ int main(int argc, char **argv)
   tty_raw();      /* put tty in raw mode */
 
   if (what == 's') {
-    fprintf(stderr, _("Download of \"%s\"\n\n"), file);
-    fflush(stderr);
-    ret = msend(file);
+    int nfiles = argc - optind;
+    if (verbose) {
+      fprintf(stderr, _("Sending %d file(s)\n\n"), nfiles);
+      fflush(stderr);
+    }
+    ret = send_batch(argv + optind, nfiles);
   } else {
-    fprintf(stderr, _("Upload of \"%s\"\n\n"), file);
-    fflush(stderr);
-    ret = mrecv(file);
+    const char *dest_arg = (argc - optind == 1) ? argv[optind] : NULL;
+    int dest_is_dir = 0;
+
+    if (dest_arg != NULL) {
+      struct stat st;
+      if (stat(dest_arg, &st) == 0 && S_ISDIR(st.st_mode)) {
+        dest_is_dir = 1;
+      }
+    }
+
+    if (verbose) {
+      fprintf(stderr, _("Receiving into %s\n\n"),
+        dest_arg ? dest_arg : "the current directory");
+      fflush(stderr);
+    }
+    ret = receive_batch(dest_arg, dest_is_dir);
   }
 
   tty_reset();
