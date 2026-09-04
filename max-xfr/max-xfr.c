@@ -15,15 +15,37 @@
 #include "intl.h"
 
 /*
- * Batch-capable MAX protocol (2026-09-01): a per-file header block
- * (name + 32-bit size) precedes each file's data, in the same spirit
- * as YMODEM's own extension of XMODEM, but reusing the ORIGINAL
- * single-file MAX block mechanism completely unchanged -- a header
- * block is nothing more than an ordinary block whose payload both
- * ends agree to interpret specially. See progs/mr.asm and progs/ms.asm
- * (the ELF-DOS side of this protocol) for the full wire-level design
+ * Batch-capable MAX protocol, length-prefixed/doubly-acknowledged
+ * chunk design (2026-09-04, replacing the earlier 2026-09-01 command-
+ * byte/address-field framing entirely). See progs/mr.asm's own header
+ * comment (the ELF-DOS side of this protocol) for the full wire-level
  * writeup; this file mirrors that design exactly, just with the
  * sender/receiver roles swapped for -s/-r respectively.
+ *
+ * Every chunk (a file's header, or one piece of its data) is: a 2-
+ * byte big-endian LENGTH, then wait for a $AA ack; if LENGTH is
+ * nonzero, that many payload bytes (paced by "-d"), then wait for a
+ * SECOND $AA ack. A LENGTH of 0 is an end marker -- of the current
+ * file's data if a header is expected next, or of the whole batch if
+ * a header chunk itself has LENGTH 0 -- and needs only the one ack
+ * (no payload phase). No command byte, no address field -- both are
+ * gone; a chunk's own length is the only framing this protocol needs.
+ *
+ * This closes a real hardware bug found the same day: the OLD
+ * protocol's un-echoed, un-acknowledged end-of-file/end-of-batch
+ * marker bytes were being silently dropped by a receiver with no
+ * hardware UART FIFO, since nothing throttled the sender from writing
+ * them back-to-back right after the receiver's slowest step (mr.asm's
+ * own real disk write for a file's last data block). Every OTHER byte
+ * in the old protocol was already naturally throttled (echo-verified
+ * header fields, or the per-byte "-d" delay); this redesign extends
+ * that same "the sender can never get ahead of the receiver" property
+ * to the whole protocol, uniformly, with no gaps left -- and,
+ * critically, each chunk's PAYLOAD ack is sent by the receiver only
+ * once it has genuinely finished processing that chunk (the disk
+ * write, or opening the destination file), not merely once the bytes
+ * are off the wire, which is what makes the receiver's own processing
+ * time part of the throttling rather than a blind spot in it.
  *
  * The OLD single-block protocol (no header, no batch, one file per
  * invocation) is gone -- mr.asm/ms.asm no longer speak it, so this
@@ -32,18 +54,16 @@
  * addressed chunks, a shape with no coherent mapping onto "one file =
  * one name + one contiguous byte stream" -- has been dropped along
  * with it; that mode was never meaningfully usable against mr.asm
- * anyway, since mr.asm has always ignored the wire's own address
- * field entirely (see mr.asm's own header comment: "the address field
- * exists for compatibility... goes unused"). ihex.c/ihex.h are left
- * in the repo untouched in case they're wanted for something else
- * later; this file just no longer links against them.
+ * anyway, since mr.asm never had any real use for a wire-level address
+ * field to begin with. ihex.c/ihex.h are left in the repo untouched in
+ * case they're wanted for something else later; this file just no
+ * longer links against them.
  *
- * Streaming, not buffering: file data is now read/written directly
- * to/from disk in BLOCK_BUF_LEN-byte chunks as it's sent/received,
+ * Streaming, not buffering: file data is read/written directly to/
+ * from disk in BLOCK_BUF_LEN-byte chunks as it's sent/received,
  * instead of loading a whole file into one fixed-size array first --
- * removes the old 64KB-per-file ceiling (a real overflow risk once
- * files could legitimately exceed that) with no behavior change for
- * anything under it.
+ * avoids a 64KB-per-file ceiling (a real overflow risk once files
+ * could legitimately exceed that).
  */
 
 #define BLOCK_BUF_LEN       512
@@ -128,48 +148,47 @@ static void host_basename(const char *path, char *buf, size_t bufcap)
 }
 
 /*
- *	send_block: send one block (header OR data -- identical wire shape
- *	either way) via the standard echo-verified mechanism, then wait
- *	for the final $AA ack. Matches the original single-file protocol's
- *	own per-field echo/verify loop exactly; the address field is
- *	always 0 now (it was only ever used to build the old chunk list
- *	for Intel-HEX reconstruction, which is gone -- see this file's own
- *	header comment).
+ *	send_chunk: write a chunk's 2-byte big-endian length, wait for the
+ *	length ack, then -- if len is nonzero -- write that many payload
+ *	bytes (paced by "-d") and wait for a SECOND ack. A len==0 call
+ *	(payload may be NULL) sends only the length and its one ack --
+ *	this is how a "no more data"/"no more files" end marker is sent,
+ *	there's no separate function or wire byte for it. See this file's
+ *	own header comment for why the payload ack specifically has to
+ *	come from the receiver only once it has finished ITS OWN
+ *	processing of the chunk, not just once the bytes are off the wire
+ *	-- that's what makes this whole design self-throttling.
  *
- *	Returns 0 on success, -1 on any echo/ack mismatch (fatal -- the
- *	two ends are now out of lock-step).
+ *	Returns 0 on success, -1 on any ack mismatch/read failure (fatal --
+ *	the two ends are now out of lock-step).
  */
-static int send_block(const uint8_t *payload, size_t len)
+static int send_chunk(const uint8_t *payload, size_t len)
 {
-  uint8_t cmd[5];
+  uint8_t hdr[2];
   uint8_t ack;
   size_t i;
 
-  cmd[0] = 0x01;
-  cmd[1] = (uint8_t)((len >> 8) & 0xff);
-  cmd[2] = (uint8_t)(len & 0xff);
-  cmd[3] = 0;
-  cmd[4] = 0;
+  hdr[0] = (uint8_t)((len >> 8) & 0xff);
+  hdr[1] = (uint8_t)(len & 0xff);
 
-  for (i = 0; i < sizeof(cmd); i++) {
-    if (write_all(cmd + i, 1) < 0) return -1;
-    if (read(STDIN_FILENO, &ack, 1) != 1 || ack != cmd[i]) {
-      fprintf(stderr, _("Error while writing (cmd = %02x, ack = %02x)\n"),
-        cmd[i], ack);
-      return -1;
-    }
+  if (write_all(hdr, 2) < 0) return -1;
+  if (read(STDIN_FILENO, &ack, 1) != 1 || ack != 0xaa) {
+    fprintf(stderr, "Error waiting for length ack (ack = %02x)\n", ack);
+    return -1;
   }
+
+  if (len == 0) return 0;
 
   for (i = 0; i < len; i++) {
     if (write_all(payload + i, 1) < 0) return -1;
-    usleep(delay);
+    if (delay) usleep(delay);
   }
 
   bdone += len;
   if (verbose) stats();
 
   if (read(STDIN_FILENO, &ack, 1) != 1 || ack != 0xaa) {
-    fprintf(stderr, "Error in ack (ack = %02x)\n", ack);
+    fprintf(stderr, "Error waiting for payload ack (ack = %02x)\n", ack);
     return -1;
   }
 
@@ -177,92 +196,46 @@ static int send_block(const uint8_t *payload, size_t len)
 }
 
 /*
- *	send_end_marker: the un-echoed $00 command byte that ends a block
- *	stream -- either "no more data for the file currently being sent"
- *	(called once per file) or "no more files at all" (called once,
- *	right after the last file, in the exact same "expecting a header
- *	next" state every file starts in -- there is no separate empty-
- *	name sentinel, matching mr.asm/ms.asm's own design). Its result is
- *	deliberately unchecked, same as the original protocol's own
- *	unconditional final write -- there's nothing more to do if this
- *	one write fails at the very point the session is already ending.
+ *	recv_chunk: read one chunk's 2-byte big-endian length and ack it
+ *	immediately (this ack means only "length received," not "chunk
+ *	fully processed" -- see this file's own header comment). If the
+ *	length is 0, that's the whole exchange -- no payload follows, and
+ *	no ack is owed by the caller. If nonzero, read that many payload
+ *	bytes into buf, but do NOT ack the payload here -- the caller must
+ *	call send_chunk_ack() once it has genuinely finished its own
+ *	processing of the payload (a disk write, or opening the
+ *	destination file), which is the whole point of this design: the
+ *	sender can never get more than one length-field ahead of what the
+ *	receiver has actually finished with.
  *
- *	Delay after the write (2026-09-04, real hardware bug): unlike
- *	every OTHER byte in this protocol -- header/data bytes are either
- *	echo-verified (self-throttling: we can't get ahead of the
- *	receiver, since we wait for ITS echo before sending the next byte)
- *	or paced by our own per-byte "-d" delay -- this marker is a bare,
- *	un-acknowledged, fire-and-forget write, and it's called back-to-
- *	back with a SECOND one at the end of a batch (file-end marker
- *	immediately followed by the outer batch-end marker) with no
- *	throttling of any kind. On a receiver with no hardware UART FIFO
- *	(confirmed on the ELF-DOS target this was found on), any byte that
- *	arrives before the receiver's own code gets back around to reading
- *	again is simply lost, not queued -- and the receiver's own busiest
- *	moment is RIGHT here: mr.asm just finished a real disk write
- *	(K_FILE_WRITE) for the file's last data block, which can easily
- *	take far longer than a byte's transmission time, before it's ready
- *	to read the next byte at all. Every OTHER block transition is
- *	naturally protected from this by the echo/ack exchange forcing us
- *	to wait for the receiver anyway; this is the one place in the
- *	whole protocol that wasn't. Confirmed as the actual root cause via
- *	a receiver-side diagnostic build that showed the raw byte after
- *	the last data block was ALWAYS the far-end trailing 'x', never a
- *	$00 -- both end markers were being silently dropped every time.
- *	Reuses the same "-d" knob as payload bytes rather than a new,
- *	separate option, since it's the identical class of "give a slow
- *	receiver time to get back to reading" pacing.
+ *	Returns 1 (length was 0 -- an end marker, already fully ack'd,
+ *	nothing owed), 0 (a real chunk: buf[0..*out_len-1] holds its
+ *	payload, an ack is still owed via send_chunk_ack()), or -1 (fatal:
+ *	a read failed, or the chunk was too large for buf).
  */
-static void send_end_marker(void)
+static int recv_chunk(uint8_t *buf, size_t bufcap, size_t *out_len)
 {
-  uint8_t end = 0x00;
-  write_all(&end, 1);
-  if (delay) usleep(delay);
-}
-
-/*
- *	recv_block: read one block's leading command byte and, if it's
- *	$01, the rest of that block's header (count hi/lo, address hi/lo
- *	-- echoed but otherwise unused) plus its payload. Every header
- *	field is individually echoed back to the sender as it's read,
- *	matching the sender's own per-field verification.
- *
- *	Returns 1 (command byte was $00 -- not echoed, no payload), 0 (a
- *	real block was received: buf[0..*out_len-1] holds its payload), or
- *	-1 (fatal: a read failed, or the command byte was neither $00 nor
- *	$01).
- */
-static int recv_block(uint8_t *buf, size_t bufcap, size_t *out_len)
-{
-  uint8_t in;
-  uint8_t b;
+  uint8_t hdr[2];
   uint16_t count;
   size_t remaining;
   uint8_t *p;
 
-  if (read(STDIN_FILENO, &in, 1) != 1) {
+  if (read(STDIN_FILENO, &hdr[0], 1) != 1) {
     fprintf(stderr, _("Read error (errno = %d)\n"), errno);
     return -1;
   }
-  if (in == 0x00) return 1;
-  if (in != 0x01) {
-    fprintf(stderr, "Invalid command: %02x\n", in);
+  if (read(STDIN_FILENO, &hdr[1], 1) != 1) {
+    fprintf(stderr, _("Read error (errno = %d)\n"), errno);
     return -1;
   }
-  write_all(&in, 1);
+  count = ((uint16_t)hdr[0] << 8) | hdr[1];
 
-  if (read(STDIN_FILENO, &b, 1) != 1) return -1;
-  count = (uint16_t)b << 8;
-  write_all(&b, 1);
+  {
+    uint8_t ack = 0xaa;
+    if (write_all(&ack, 1) < 0) return -1;
+  }
 
-  if (read(STDIN_FILENO, &b, 1) != 1) return -1;
-  count |= b;
-  write_all(&b, 1);
-
-  if (read(STDIN_FILENO, &b, 1) != 1) return -1;   /* address hi, unused */
-  write_all(&b, 1);
-  if (read(STDIN_FILENO, &b, 1) != 1) return -1;   /* address lo, unused */
-  write_all(&b, 1);
+  if (count == 0) return 1;
 
   if (count > bufcap) {
     fprintf(stderr, "Block too large (%u bytes).\n", (unsigned)count);
@@ -284,13 +257,21 @@ static int recv_block(uint8_t *buf, size_t bufcap, size_t *out_len)
   bdone += count;
   if (verbose) stats();
 
-  {
-    uint8_t ack = 0xaa;
-    write_all(&ack, 1);
-  }
-
   *out_len = count;
   return 0;
+}
+
+/*
+ *	send_chunk_ack: write a chunk's payload ack. Called by
+ *	receive_batch() only once it has finished its own processing of a
+ *	chunk recv_chunk() reported as "real" (return value 0) -- see this
+ *	file's own header comment and recv_chunk()'s own for why that
+ *	timing is the whole point.
+ */
+static int send_chunk_ack(void)
+{
+  uint8_t ack = 0xaa;
+  return write_all(&ack, 1);
 }
 
 /*
@@ -384,7 +365,7 @@ static int send_batch(char **files, int nfiles)
         (unsigned long)st.st_size);
     }
 
-    if (send_block(hdr, hdrlen) < 0) {
+    if (send_chunk(hdr, hdrlen) < 0) {
       fclose(fp);
       fatal = 1;
       break;
@@ -392,7 +373,7 @@ static int send_batch(char **files, int nfiles)
 
     file_ok = 1;
     while ((n = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
-      if (send_block(chunk, n) < 0) {
+      if (send_chunk(chunk, n) < 0) {
         file_ok = 0;
         break;
       }
@@ -408,16 +389,15 @@ static int send_batch(char **files, int nfiles)
       break;
     }
 
-    send_end_marker();         /* end of THIS file's data -- no echo,
-                                 * no ack wait here (see mr.asm/ms.asm's
-                                 * own header comments for why: that
-                                 * only happens once, at the very end
-                                 * of the whole batch) */
+    if (send_chunk(NULL, 0) < 0) {     /* end of THIS file's data */
+      fatal = 1;
+      break;
+    }
     any_ok++;
   }
 
   if (!fatal) {
-    send_end_marker();         /* outer "no more files" terminator */
+    if (send_chunk(NULL, 0) < 0) fatal = 1;    /* outer "no more files" */
   }
 
   if (verbose) {
@@ -472,12 +452,12 @@ static int receive_batch(const char *dest_arg, int dest_is_dir)
 
   for (;;) {
     size_t len = 0;
-    int r = recv_block(buf, sizeof(buf), &len);
+    int r = recv_chunk(buf, sizeof(buf), &len);
 
     if (r < 0) { fatal = 1; break; }
 
     if (r == 1) {
-      /* end marker */
+      /* end marker -- already fully ack'd by recv_chunk, nothing owed */
       if (expecting_header) break;   /* end of the whole batch */
 
       /* end of the CURRENT file's data */
@@ -487,7 +467,7 @@ static int receive_batch(const char *dest_arg, int dest_is_dir)
       continue;
     }
 
-    /* r == 0: a real block */
+    /* r == 0: a real chunk, payload ack still owed */
     if (expecting_header) {
       size_t real_namelen = 0;
       while (real_namelen < len && buf[real_namelen] != 0) real_namelen++;
@@ -546,18 +526,31 @@ static int receive_batch(const char *dest_arg, int dest_is_dir)
         }
       }
 
+      /* header's payload ack -- sent only now that we're genuinely
+       * ready for data (file opened, or a decision to discard has
+       * already been made on every path above) */
+      if (send_chunk_ack() < 0) { fatal = 1; break; }
+
       expecting_header = 0;
     } else {
-      /* data block */
+      /* data chunk */
       if (!discarding && out) {
         if (fwrite(buf, 1, len, out) != len) {
           fprintf(stderr, "%s: write error\n", destpath);
           fclose(out);
           out = NULL;
           fatal = 1;
-          break;
+          break;                /* no ack -- fatal, matches mr.asm's
+                                  * own identical policy for this exact
+                                  * case */
         }
       }
+
+      /* ack AFTER the write completes (or was skipped while
+       * discarding) -- the whole point of this design: the sender
+       * genuinely waits for us to be done, not just for the wire read
+       * to finish */
+      if (send_chunk_ack() < 0) { fatal = 1; break; }
     }
   }
 
