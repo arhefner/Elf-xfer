@@ -82,9 +82,12 @@
  * one name + one contiguous byte stream" -- has been dropped along
  * with it; that mode was never meaningfully usable against mr.asm
  * anyway, since mr.asm never had any real use for a wire-level address
- * field to begin with. ihex.c/ihex.h are left in the repo untouched in
- * case they're wanted for something else later; this file just no
- * longer links against them.
+ * field to begin with. ihex.c/ihex.h themselves were removed
+ * (2026-09-05) rather than left unlinked -- BIOS-level hex/binary
+ * transfers are getting their own separate, dedicated utility instead,
+ * since trying to make one tool do both this batch file-transfer
+ * protocol and raw memory-image transfer at once had already proven
+ * unwieldy.
  *
  * Streaming, not buffering: file data is read/written directly to/
  * from disk in BLOCK_BUF_LEN-byte chunks as it's sent/received,
