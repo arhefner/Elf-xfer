@@ -6,4 +6,6 @@
 *.elfos
 *.o
 max-xfr
-
+!max-xfr/
+sertest
+!sertest/
