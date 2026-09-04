@@ -733,20 +733,7 @@ void tty_raw(void)
   raw.c_oflag &= ~(OPOST);
 
   /* control modes - set 8 bit chars */
-  raw.c_cflag |= (CS8 | CLOCAL);
-  /* CRTSCTS off (2026-09-05, real hardware bug -- see sertest.c's own
-   * tty_raw() for the full account, found there first): a simple bit-
-   * banged UART has no RTS/CTS lines and never asserts CTS, so if the
-   * device this port is attached to has hardware flow control ON by
-   * default (never touched here before, so whatever orig_termios
-   * already had stayed in effect), write() to it can block forever
-   * waiting for a CTS that will never come -- indistinguishable from
-   * a receive-side timing bug, since it hangs BOTH ends at once (the
-   * sender stuck in write(), the receiver never seeing a byte because
-   * none ever actually went out). CLOCAL also set defensively, so
-   * open() itself can't block on a carrier-detect signal an embedded/
-   * GPIO connection has no way to provide. */
-  raw.c_cflag &= ~CRTSCTS;
+  raw.c_cflag |= (CS8);
 
   /* local modes - clear giving: echoing off, canonical off (no erase with
      backspace, ^U,...),  no extended functions, no signal chars (^Z,^C) */
@@ -757,18 +744,7 @@ void tty_raw(void)
                                               after first byte seen      */
   raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 0; /* immediate - anything       */
   raw.c_cc[VMIN] = 2; raw.c_cc[VTIME] = 0; /* after two bytes, no timer  */
-  /* after a byte, or 25.5 seconds (VTIME's own 1-byte max -- tenths of
-   * a second) with none: was VTIME=8 (0.8s) until 2026-09-05, when a
-   * real hardware round found that too short whenever starting this
-   * end and starting the ELF-DOS end require the user to physically
-   * switch terminals/connections in between (e.g. console on one
-   * UART, transfer on another) -- 0.8s isn't much time for that, and
-   * this setting applies to every read() for the life of the process,
-   * not just the initial handshake, so there's no reason to keep it
-   * tight. A genuine failure (nothing ever responds) still eventually
-   * times out and is reported via read_expected_byte()'s own accurate
-   * timeout/mismatch distinction -- it just takes longer to notice. */
-  raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 255;
+  raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 8; /* after a byte or .8 seconds */
 
   /* put terminal in raw mode after flushing */
   if (tcsetattr(ttyfd,TCSAFLUSH,&raw) < 0) fatal("can't set raw mode");
