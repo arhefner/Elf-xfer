@@ -31,21 +31,30 @@
  * (no payload phase). No command byte, no address field -- both are
  * gone; a chunk's own length is the only framing this protocol needs.
  *
- * This closes a real hardware bug found the same day: the OLD
- * protocol's un-echoed, un-acknowledged end-of-file/end-of-batch
- * marker bytes were being silently dropped by a receiver with no
- * hardware UART FIFO, since nothing throttled the sender from writing
+ * This closes two real hardware bugs found on two different days,
+ * both the identical class: the sender getting ahead of the receiver
+ * on hardware with no UART FIFO to absorb it. The first (2026-09-04,
+ * fixed by this whole chunk redesign): the OLD protocol's un-echoed,
+ * un-acknowledged end-of-file/end-of-batch marker bytes were being
+ * silently dropped, since nothing throttled the sender from writing
  * them back-to-back right after the receiver's slowest step (mr.asm's
- * own real disk write for a file's last data block). Every OTHER byte
- * in the old protocol was already naturally throttled (echo-verified
- * header fields, or the per-byte "-d" delay); this redesign extends
- * that same "the sender can never get ahead of the receiver" property
- * to the whole protocol, uniformly, with no gaps left -- and,
- * critically, each chunk's PAYLOAD ack is sent by the receiver only
- * once it has genuinely finished processing that chunk (the disk
- * write, or opening the destination file), not merely once the bytes
- * are off the wire, which is what makes the receiver's own processing
- * time part of the throttling rather than a blind spot in it.
+ * own real disk write for a file's last data block) -- every OTHER
+ * byte in the old protocol was already naturally throttled (echo-
+ * verified header fields, or the per-byte "-d" delay), so this
+ * redesign extends that same "the sender can never get ahead"
+ * property to the whole protocol, uniformly: each chunk's PAYLOAD ack
+ * is sent only once the receiver has genuinely finished processing
+ * that chunk (the disk write, or opening the destination file), not
+ * merely once the bytes are off the wire. The second bug (same day, in
+ * this redesign's own first draft): a zero-length chunk's ONE ack was
+ * being sent unconditionally, immediately upon reading the length --
+ * safe in isolation, but on the receiving side (mr.asm) that ack was
+ * sent BEFORE closing the file the marker refers to, letting the
+ * sender race ahead and write the NEXT thing while the receiver was
+ * still mid-close. Fixed the identical way: the zero-length chunk's
+ * ack is now deferred to whichever caller actually knows when its own
+ * processing (closing a file, or nothing at all for the outer batch-
+ * end marker) is genuinely done -- see recv_chunk()'s own comment.
  *
  * The OLD single-block protocol (no header, no batch, one file per
  * invocation) is gone -- mr.asm/ms.asm no longer speak it, so this
@@ -196,22 +205,34 @@ static int send_chunk(const uint8_t *payload, size_t len)
 }
 
 /*
- *	recv_chunk: read one chunk's 2-byte big-endian length and ack it
- *	immediately (this ack means only "length received," not "chunk
- *	fully processed" -- see this file's own header comment). If the
+ *	recv_chunk: read one chunk's 2-byte big-endian length. If the
  *	length is 0, that's the whole exchange -- no payload follows, and
- *	no ack is owed by the caller. If nonzero, read that many payload
- *	bytes into buf, but do NOT ack the payload here -- the caller must
- *	call send_chunk_ack() once it has genuinely finished its own
- *	processing of the payload (a disk write, or opening the
- *	destination file), which is the whole point of this design: the
- *	sender can never get more than one length-field ahead of what the
- *	receiver has actually finished with.
+ *	NO ack is sent here: the caller must call send_chunk_ack() once it
+ *	has finished whatever a zero-length chunk implies on its own end
+ *	(closing the file it was just writing, for instance) -- deferred
+ *	for the identical reason a nonzero chunk's PAYLOAD ack is deferred
+ *	(see below): acking before that finishes would let the sender race
+ *	ahead of processing we haven't actually completed yet. If nonzero,
+ *	ack the length immediately (safe here, since nothing slow happens
+ *	before the payload itself starts flowing), read that many payload
+ *	bytes into buf, but do NOT ack the payload -- the caller calls
+ *	send_chunk_ack() once it has genuinely finished its own processing
+ *	of it (a disk write, or opening the destination file), which is
+ *	the whole point of this design: the sender can never get more than
+ *	one length-field ahead of what the receiver has actually finished
+ *	with. (On the ELF-DOS side, the zero-length case originally acked
+ *	immediately too, and a real hardware hang on 2026-09-04 traced
+ *	directly to that: the sender raced ahead and wrote the next thing
+ *	while mr.asm was still closing the file, on hardware with no UART
+ *	FIFO to absorb it. Applied the same fix here for symmetry/
+ *	correctness even though a fast host with real OS-level buffering
+ *	is unlikely to ever hit it in practice.)
  *
- *	Returns 1 (length was 0 -- an end marker, already fully ack'd,
- *	nothing owed), 0 (a real chunk: buf[0..*out_len-1] holds its
- *	payload, an ack is still owed via send_chunk_ack()), or -1 (fatal:
- *	a read failed, or the chunk was too large for buf).
+ *	Returns 1 (length was 0 -- an end marker; an ack is still owed via
+ *	send_chunk_ack()), 0 (a real chunk: buf[0..*out_len-1] holds its
+ *	payload, the length has already been ack'd but the PAYLOAD ack is
+ *	still owed via send_chunk_ack()), or -1 (fatal: a read failed, or
+ *	the chunk was too large for buf).
  */
 static int recv_chunk(uint8_t *buf, size_t bufcap, size_t *out_len)
 {
@@ -230,12 +251,12 @@ static int recv_chunk(uint8_t *buf, size_t bufcap, size_t *out_len)
   }
   count = ((uint16_t)hdr[0] << 8) | hdr[1];
 
+  if (count == 0) return 1;
+
   {
     uint8_t ack = 0xaa;
     if (write_all(&ack, 1) < 0) return -1;
   }
-
-  if (count == 0) return 1;
 
   if (count > bufcap) {
     fprintf(stderr, "Block too large (%u bytes).\n", (unsigned)count);
@@ -457,12 +478,18 @@ static int receive_batch(const char *dest_arg, int dest_is_dir)
     if (r < 0) { fatal = 1; break; }
 
     if (r == 1) {
-      /* end marker -- already fully ack'd by recv_chunk, nothing owed */
-      if (expecting_header) break;   /* end of the whole batch */
+      /* end marker -- ack deferred from recv_chunk until our own
+       * processing (if any) is done, see recv_chunk's own comment */
+      if (expecting_header) {
+        /* end of the whole batch -- nothing to close, ack right away */
+        if (send_chunk_ack() < 0) fatal = 1;
+        break;
+      }
 
       /* end of the CURRENT file's data */
       if (out) { fclose(out); out = NULL; any_ok++; }
       discarding = 0;
+      if (send_chunk_ack() < 0) { fatal = 1; break; }
       expecting_header = 1;
       continue;
     }
