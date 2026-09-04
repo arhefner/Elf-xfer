@@ -744,7 +744,18 @@ void tty_raw(void)
                                               after first byte seen      */
   raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 0; /* immediate - anything       */
   raw.c_cc[VMIN] = 2; raw.c_cc[VTIME] = 0; /* after two bytes, no timer  */
-  raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 8; /* after a byte or .8 seconds */
+  /* after a byte, or 25.5 seconds (VTIME's own 1-byte max -- tenths of
+   * a second) with none: was VTIME=8 (0.8s) until 2026-09-05, when a
+   * real hardware round found that too short whenever starting this
+   * end and starting the ELF-DOS end require the user to physically
+   * switch terminals/connections in between (e.g. console on one
+   * UART, transfer on another) -- 0.8s isn't much time for that, and
+   * this setting applies to every read() for the life of the process,
+   * not just the initial handshake, so there's no reason to keep it
+   * tight. A genuine failure (nothing ever responds) still eventually
+   * times out and is reported via read_expected_byte()'s own accurate
+   * timeout/mismatch distinction -- it just takes longer to notice. */
+  raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 255;
 
   /* put terminal in raw mode after flushing */
   if (tcsetattr(ttyfd,TCSAFLUSH,&raw) < 0) fatal("can't set raw mode");
