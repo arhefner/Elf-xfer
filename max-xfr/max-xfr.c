@@ -733,7 +733,20 @@ void tty_raw(void)
   raw.c_oflag &= ~(OPOST);
 
   /* control modes - set 8 bit chars */
-  raw.c_cflag |= (CS8);
+  raw.c_cflag |= (CS8 | CLOCAL);
+  /* CRTSCTS off (2026-09-05, real hardware bug -- see sertest.c's own
+   * tty_raw() for the full account, found there first): a simple bit-
+   * banged UART has no RTS/CTS lines and never asserts CTS, so if the
+   * device this port is attached to has hardware flow control ON by
+   * default (never touched here before, so whatever orig_termios
+   * already had stayed in effect), write() to it can block forever
+   * waiting for a CTS that will never come -- indistinguishable from
+   * a receive-side timing bug, since it hangs BOTH ends at once (the
+   * sender stuck in write(), the receiver never seeing a byte because
+   * none ever actually went out). CLOCAL also set defensively, so
+   * open() itself can't block on a carrier-detect signal an embedded/
+   * GPIO connection has no way to provide. */
+  raw.c_cflag &= ~CRTSCTS;
 
   /* local modes - clear giving: echoing off, canonical off (no erase with
      backspace, ^U,...),  no extended functions, no signal chars (^Z,^C) */

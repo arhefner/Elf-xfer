@@ -189,7 +189,21 @@ static void tty_raw(void)
 
   raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
   raw.c_oflag &= ~(OPOST);
-  raw.c_cflag |= (CS8);
+  raw.c_cflag |= (CS8 | CLOCAL);
+  /* CRTSCTS off (2026-09-05, real hardware bug): a simple bit-banged
+   * UART has no RTS/CTS lines at all and never asserts CTS, so if the
+   * device this port is attached to happens to have hardware flow
+   * control ON by default (never touched here before, so whatever
+   * orig_termios already had stayed in effect), write() to it blocks
+   * forever waiting for a CTS that will never come -- explains a
+   * hang on BOTH ends at once (the sender stuck in write(), the
+   * receiver never seeing a byte because none ever actually went out)
+   * that was otherwise indistinguishable from a receive-side timing
+   * bug. CLOCAL also set defensively, so open() itself can't block
+   * waiting for a carrier-detect signal an embedded/GPIO connection
+   * has no way to provide.
+   */
+  raw.c_cflag &= ~CRTSCTS;
   raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
 
   /* VMIN=1, VTIME=0: block until exactly one byte is available, no
