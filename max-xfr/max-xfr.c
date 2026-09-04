@@ -186,11 +186,38 @@ static int send_block(const uint8_t *payload, size_t len)
  *	deliberately unchecked, same as the original protocol's own
  *	unconditional final write -- there's nothing more to do if this
  *	one write fails at the very point the session is already ending.
+ *
+ *	Delay after the write (2026-09-04, real hardware bug): unlike
+ *	every OTHER byte in this protocol -- header/data bytes are either
+ *	echo-verified (self-throttling: we can't get ahead of the
+ *	receiver, since we wait for ITS echo before sending the next byte)
+ *	or paced by our own per-byte "-d" delay -- this marker is a bare,
+ *	un-acknowledged, fire-and-forget write, and it's called back-to-
+ *	back with a SECOND one at the end of a batch (file-end marker
+ *	immediately followed by the outer batch-end marker) with no
+ *	throttling of any kind. On a receiver with no hardware UART FIFO
+ *	(confirmed on the ELF-DOS target this was found on), any byte that
+ *	arrives before the receiver's own code gets back around to reading
+ *	again is simply lost, not queued -- and the receiver's own busiest
+ *	moment is RIGHT here: mr.asm just finished a real disk write
+ *	(K_FILE_WRITE) for the file's last data block, which can easily
+ *	take far longer than a byte's transmission time, before it's ready
+ *	to read the next byte at all. Every OTHER block transition is
+ *	naturally protected from this by the echo/ack exchange forcing us
+ *	to wait for the receiver anyway; this is the one place in the
+ *	whole protocol that wasn't. Confirmed as the actual root cause via
+ *	a receiver-side diagnostic build that showed the raw byte after
+ *	the last data block was ALWAYS the far-end trailing 'x', never a
+ *	$00 -- both end markers were being silently dropped every time.
+ *	Reuses the same "-d" knob as payload bytes rather than a new,
+ *	separate option, since it's the identical class of "give a slow
+ *	receiver time to get back to reading" pacing.
  */
 static void send_end_marker(void)
 {
   uint8_t end = 0x00;
   write_all(&end, 1);
+  if (delay) usleep(delay);
 }
 
 /*
