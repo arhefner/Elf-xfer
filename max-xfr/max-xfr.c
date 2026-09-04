@@ -56,6 +56,24 @@
  * processing (closing a file, or nothing at all for the outer batch-
  * end marker) is genuinely done -- see recv_chunk()'s own comment.
  *
+ * BIT-BANG UART FIX (2026-09-05): a real hardware UART has at least a
+ * one-byte hold register that captures an incoming byte automatically,
+ * regardless of what the receiving CPU happens to be doing at that
+ * instant. A bit-banged UART has none of that -- the CPU itself has to
+ * be inside its own polling loop for the entire duration a bit
+ * arrives, or it's simply gone. The 2-byte length field used to go out
+ * unpaced (a single write_all(hdr, 2)), which was fine on a real UART
+ * but could make a bit-banged receiver miss the second byte's start
+ * bit entirely if it hadn't yet finished the bookkeeping between its
+ * own two per-byte reads -- see send_chunk()'s own comment for the
+ * full account. Also found along the way: every ack/handshake check in
+ * this file used to read `x` and print it unconditionally on any
+ * failure, without checking whether read() actually returned a byte at
+ * all -- a genuine timeout (tty_raw()'s own VMIN=0/VTIME=8, i.e. 0.8s)
+ * leaves the buffer untouched, so a slow-to-respond far end produced a
+ * misleading "ack = 00" indistinguishable from a real wrong byte.
+ * read_expected_byte() now reports which one actually happened.
+ *
  * The OLD single-block protocol (no header, no batch, one file per
  * invocation) is gone -- mr.asm/ms.asm no longer speak it, so this
  * tool can't either. This also means the old Intel-HEX (.hex/.intel)
@@ -157,9 +175,56 @@ static void host_basename(const char *path, char *buf, size_t bufcap)
 }
 
 /*
- *	send_chunk: write a chunk's 2-byte big-endian length, wait for the
+ *	read_expected_byte: read a single byte and check it against
+ *	`expected`, with an error message that distinguishes a genuine
+ *	timeout (no byte arrived within tty_raw()'s own read timeout --
+ *	currently VMIN=0/VTIME=8, i.e. 0.8 seconds) from a real byte
+ *	mismatch, rather than printing whatever uninitialized stack
+ *	garbage happened to be sitting in the read buffer on a timeout.
+ *
+ *	Found 2026-09-05 chasing an intermittent bit-bang-UART hardware
+ *	failure: every "ack"/"handshake" check in this file used to do
+ *	`read(fd, &x, 1) != 1 || x != expected` directly and print `x`
+ *	unconditionally -- but read() returning 0 (a genuine timeout, not
+ *	an error) never touches `x` at all, so a slow or not-yet-ready far
+ *	end produced a MISLEADING "ack = 00" report indistinguishable from
+ *	the far end genuinely having sent a wrong byte. Both are real
+ *	possibilities on a bit-banged receiver (see send_chunk's own header
+ *	comment), and telling them apart matters for diagnosing which one
+ *	actually happened.
+ *
+ *	what: a short description used in the error message (e.g. "length
+ *	ack", "handshake sync").
+ *	Returns 0 (the expected byte was received), -1 (timeout, mismatch,
+ *	or a genuine read error -- already reported to stderr).
+ */
+static int read_expected_byte(const char *what, uint8_t expected)
+{
+  uint8_t got;
+  ssize_t ret = read(STDIN_FILENO, &got, 1);
+
+  if (ret == 0) {
+    fprintf(stderr, "Error waiting for %s (timeout, no response)\n", what);
+    return -1;
+  }
+  if (ret < 0) {
+    fprintf(stderr, "Error waiting for %s (read error, errno = %d)\n",
+      what, errno);
+    return -1;
+  }
+  if (got != expected) {
+    fprintf(stderr, "Error waiting for %s (got %02x, expected %02x)\n",
+      what, got, expected);
+    return -1;
+  }
+  return 0;
+}
+
+/*
+ *	send_chunk: write a chunk's 2-byte big-endian length (each byte
+ *	paced by "-d", same as payload -- see below for why), wait for the
  *	length ack, then -- if len is nonzero -- write that many payload
- *	bytes (paced by "-d") and wait for a SECOND ack. A len==0 call
+ *	bytes (also paced) and wait for a SECOND ack. A len==0 call
  *	(payload may be NULL) sends only the length and its one ack --
  *	this is how a "no more data"/"no more files" end marker is sent,
  *	there's no separate function or wire byte for it. See this file's
@@ -168,23 +233,43 @@ static void host_basename(const char *path, char *buf, size_t bufcap)
  *	processing of the chunk, not just once the bytes are off the wire
  *	-- that's what makes this whole design self-throttling.
  *
+ *	Pacing the length bytes too (2026-09-05, real hardware bug on a
+ *	bit-banged receiver): a real hardware UART has at least a one-byte
+ *	hold register that captures an incoming byte regardless of what
+ *	the receiving CPU happens to be doing at that instant -- payload
+ *	bytes already relied on that margin being enough on their own even
+ *	before this fix, via "-d" pacing giving the CPU time to finish its
+ *	own bookkeeping and get back to reading. A bit-banged UART has NO
+ *	such buffer at all: the CPU itself has to be inside its own receive
+ *	polling loop for the entire duration a bit arrives, or that bit is
+ *	gone, not queued. The 2-byte length field used to go out back-to-
+ *	back with zero pacing (write_all(hdr, 2)) -- harmless on a real
+ *	UART, but on mr.asm's bit-bang receiver the handful of instructions
+ *	between its own two per-byte reads (storing the first byte before
+ *	reading the second) was sometimes enough to miss the second byte's
+ *	start bit entirely, producing exactly the intermittent failures
+ *	this was found from: sometimes failing at the handshake itself
+ *	(also unpaced, see send_batch below), sometimes one step further
+ *	at this length field -- never at the same point twice, consistent
+ *	with marginal timing rather than a deterministic protocol bug.
+ *
  *	Returns 0 on success, -1 on any ack mismatch/read failure (fatal --
  *	the two ends are now out of lock-step).
  */
 static int send_chunk(const uint8_t *payload, size_t len)
 {
   uint8_t hdr[2];
-  uint8_t ack;
   size_t i;
 
   hdr[0] = (uint8_t)((len >> 8) & 0xff);
   hdr[1] = (uint8_t)(len & 0xff);
 
-  if (write_all(hdr, 2) < 0) return -1;
-  if (read(STDIN_FILENO, &ack, 1) != 1 || ack != 0xaa) {
-    fprintf(stderr, "Error waiting for length ack (ack = %02x)\n", ack);
-    return -1;
-  }
+  if (write_all(&hdr[0], 1) < 0) return -1;
+  if (delay) usleep(delay);
+  if (write_all(&hdr[1], 1) < 0) return -1;
+  if (delay) usleep(delay);
+
+  if (read_expected_byte("length ack", 0xaa) < 0) return -1;
 
   if (len == 0) return 0;
 
@@ -196,10 +281,7 @@ static int send_chunk(const uint8_t *payload, size_t len)
   bdone += len;
   if (verbose) stats();
 
-  if (read(STDIN_FILENO, &ack, 1) != 1 || ack != 0xaa) {
-    fprintf(stderr, "Error waiting for payload ack (ack = %02x)\n", ack);
-    return -1;
-  }
+  if (read_expected_byte("payload ack", 0xaa) < 0) return -1;
 
   return 0;
 }
@@ -326,16 +408,12 @@ static int send_batch(char **files, int nfiles)
 {
   int i;
   int any_ok = 0, any_err = 0, fatal = 0;
-  uint8_t ack;
   uint8_t sync = 0x55;
 
   clock_gettime(CLOCK_MONOTONIC, &start);
 
   if (write_all(&sync, 1) < 0) return -1;
-  if (read(STDIN_FILENO, &ack, 1) != 1 || ack != 0xaa) {
-    fprintf(stderr, "Invalid handshake: %02x.\n", ack);
-    return -1;
-  }
+  if (read_expected_byte("handshake ack", 0xaa) < 0) return -1;
 
   for (i = 0; i < nfiles; i++) {
     const char *path = files[i];
@@ -452,7 +530,6 @@ static int send_batch(char **files, int nfiles)
 static int receive_batch(const char *dest_arg, int dest_is_dir)
 {
   uint8_t ack = 0xaa;
-  uint8_t in;
   int expecting_header = 1;
   int any_ok = 0, any_err = 0, fatal = 0;
   int single_used = 0;
@@ -466,10 +543,7 @@ static int receive_batch(const char *dest_arg, int dest_is_dir)
   clock_gettime(CLOCK_MONOTONIC, &start);
 
   if (write_all(&ack, 1) < 0) return -1;
-  if (read(STDIN_FILENO, &in, 1) != 1 || in != 0x55) {
-    fprintf(stderr, "Invalid handshake: %02x\n", in);
-    return -1;
-  }
+  if (read_expected_byte("handshake sync", 0x55) < 0) return -1;
 
   for (;;) {
     size_t len = 0;
