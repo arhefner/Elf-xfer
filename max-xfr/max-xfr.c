@@ -225,6 +225,39 @@ static int read_expected_byte(const char *what, uint8_t expected)
 }
 
 /*
+ *	read_one_byte: read exactly one byte into *out, with an error
+ *	message that distinguishes a genuine timeout from a real read()
+ *	failure -- see read_expected_byte()'s own comment for why that
+ *	distinction matters. Used by recv_chunk() for the 2-byte length
+ *	field, where (unlike read_expected_byte()) there's no single fixed
+ *	value to compare against.
+ *
+ *	Found 2026-09-05: this exact site was still printing "Read error
+ *	(errno = 0)" on a genuine timeout mid-transfer (errno is untouched
+ *	by a read() that returns 0), on the largest file sent so far over
+ *	a bit-banged connection -- left unfixed at the time
+ *	read_expected_byte() was introduced, since it doesn't compare
+ *	against one fixed value, but the same ambiguity applies here too.
+ *
+ *	Returns 0 (byte received), -1 (timeout or read error -- already
+ *	reported).
+ */
+static int read_one_byte(uint8_t *out)
+{
+  ssize_t ret = read(STDIN_FILENO, out, 1);
+
+  if (ret == 0) {
+    fprintf(stderr, "Read error (timeout, no response)\n");
+    return -1;
+  }
+  if (ret < 0) {
+    fprintf(stderr, "Read error (errno = %d)\n", errno);
+    return -1;
+  }
+  return 0;
+}
+
+/*
  *	send_chunk: write a chunk's 2-byte big-endian length (each byte
  *	paced by "-d", same as payload -- see below for why), wait for the
  *	length ack, then -- if len is nonzero -- write that many payload
@@ -327,14 +360,8 @@ static int recv_chunk(uint8_t *buf, size_t bufcap, size_t *out_len)
   size_t remaining;
   uint8_t *p;
 
-  if (read(STDIN_FILENO, &hdr[0], 1) != 1) {
-    fprintf(stderr, _("Read error (errno = %d)\n"), errno);
-    return -1;
-  }
-  if (read(STDIN_FILENO, &hdr[1], 1) != 1) {
-    fprintf(stderr, _("Read error (errno = %d)\n"), errno);
-    return -1;
-  }
+  if (read_one_byte(&hdr[0]) < 0) return -1;
+  if (read_one_byte(&hdr[1]) < 0) return -1;
   count = ((uint16_t)hdr[0] << 8) | hdr[1];
 
   if (count == 0) return 1;
@@ -353,7 +380,11 @@ static int recv_chunk(uint8_t *buf, size_t bufcap, size_t *out_len)
   remaining = count;
   while (remaining) {
     ssize_t ret = read(STDIN_FILENO, p, remaining);
-    if (ret <= 0) {
+    if (ret == 0) {
+      fprintf(stderr, "Read error (timeout, no response)\n");
+      return -1;
+    }
+    if (ret < 0) {
       fprintf(stderr, _("Read error (errno = %d)\n"), errno);
       return -1;
     }
