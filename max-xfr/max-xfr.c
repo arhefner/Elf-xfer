@@ -542,7 +542,7 @@ static int send_batch(char **files, int nfiles)
     hdrlen = namelen + 5;
 
     if (verbose) {
-      fprintf(stderr, "Sending %s (%lu bytes)...\n", base,
+      fprintf(stderr, "\nSending %s (%lu bytes)...\n", base,
         (unsigned long)st.st_size);
     }
 
@@ -706,7 +706,7 @@ static int receive_batch(const char *dest_arg, int dest_is_dir)
           discarding = 1;
           any_err++;
         } else if (verbose) {
-          fprintf(stderr, "Receiving %s (%lu bytes)...\n", destpath,
+          fprintf(stderr, "\nReceiving %s (%lu bytes)...\n", destpath,
             (unsigned long)cur_size);
         }
       }

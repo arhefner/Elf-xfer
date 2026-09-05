@@ -92,9 +92,9 @@ static int do_send(const char *str)
   b = 13;
   if (write_all(&b, 1) < 0) return -1;
   if (delay) usleep(delay);
-  b = 10;
-  if (write_all(&b, 1) < 0) return -1;
-  if (delay) usleep(delay);
+//  b = 10;
+//  if (write_all(&b, 1) < 0) return -1;
+//  if (delay) usleep(delay);
 
   fprintf(stderr, "Sent.\n");
   return 0;
