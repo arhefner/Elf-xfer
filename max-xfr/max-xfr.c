@@ -69,8 +69,9 @@
  * full account. Also found along the way: every ack/handshake check in
  * this file used to read `x` and print it unconditionally on any
  * failure, without checking whether read() actually returned a byte at
- * all -- a genuine timeout (tty_raw()'s own VMIN=0/VTIME=8, i.e. 0.8s)
- * leaves the buffer untouched, so a slow-to-respond far end produced a
+ * all -- a genuine timeout (tty_raw()'s own read timeout, see its own
+ * comment for the current value and history) leaves the buffer
+ * untouched, so a slow-to-respond far end produced a
  * misleading "ack = 00" indistinguishable from a real wrong byte.
  * read_expected_byte() now reports which one actually happened.
  *
@@ -180,10 +181,10 @@ static void host_basename(const char *path, char *buf, size_t bufcap)
 /*
  *	read_expected_byte: read a single byte and check it against
  *	`expected`, with an error message that distinguishes a genuine
- *	timeout (no byte arrived within tty_raw()'s own read timeout --
- *	currently VMIN=0/VTIME=8, i.e. 0.8 seconds) from a real byte
- *	mismatch, rather than printing whatever uninitialized stack
- *	garbage happened to be sitting in the read buffer on a timeout.
+ *	timeout (no byte arrived within tty_raw()'s own read timeout, see
+ *	its own comment for the current value) from a real byte mismatch,
+ *	rather than printing whatever uninitialized stack garbage happened
+ *	to be sitting in the read buffer on a timeout.
  *
  *	Found 2026-09-05 chasing an intermittent bit-bang-UART hardware
  *	failure: every "ack"/"handshake" check in this file used to do
@@ -747,7 +748,22 @@ void tty_raw(void)
                                               after first byte seen      */
   raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 0; /* immediate - anything       */
   raw.c_cc[VMIN] = 2; raw.c_cc[VTIME] = 0; /* after two bytes, no timer  */
-  raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 8; /* after a byte or .8 seconds */
+  /* after a byte, or 25.5 seconds (VTIME's own 1-byte max -- tenths of
+   * a second) with none: was VTIME=8 (0.8s) until 2026-09-05. Real
+   * confirmed need: max-xfr -r writes its own $AA and immediately
+   * blocks waiting for the far end's $55 sync byte -- the user has to
+   * physically switch to the OTHER machine and start ms/max-xfr -s
+   * there in between, and 0.8s isn't much time for that. (An earlier
+   * attempt at this same change was reverted the same day over a
+   * DIFFERENT, unrelated failure that turned out to be a disconnected
+   * bit-bang RX line, not a timing issue at all -- this reapplies it
+   * for the real, confirmed reason.) This setting applies to every
+   * read() for the life of the process, not just the initial
+   * handshake, so there's no correctness reason to keep it tight -- a
+   * genuine failure (nothing ever responds) still eventually times out
+   * and is reported accurately via read_expected_byte(), it just takes
+   * longer to notice. */
+  raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 255;
 
   /* put terminal in raw mode after flushing */
   if (tcsetattr(ttyfd,TCSAFLUSH,&raw) < 0) fatal("can't set raw mode");
