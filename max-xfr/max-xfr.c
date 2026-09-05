@@ -315,8 +315,11 @@ static int send_chunk(const uint8_t *payload, size_t len)
     if (delay) usleep(delay);
   }
 
-  bdone += len;
-  if (verbose) stats();
+  /* NOT counted/reported here via stats() -- send_batch() credits
+   * real DATA chunks only, once it knows what it's counting; see
+   * recv_chunk()'s own comment on the receiving side for why a
+   * header's own bytes are kept out of the "Kbytes transferred"
+   * running total. */
 
   if (read_expected_byte("payload ack", 0xaa) < 0) return -1;
 
@@ -400,8 +403,14 @@ static int recv_chunk(uint8_t *buf, size_t bufcap, size_t *out_len)
     remaining -= (size_t)ret;
   }
 
-  bdone += count;
-  if (verbose) stats();
+  /* NOT counted/reported here via stats() -- this fires for a
+   * header's own payload too, which receive_batch() hasn't parsed
+   * into a filename yet at this point, so a stats() call here would
+   * print a "Kbytes transferred" line before the matching "Receiving
+   * <name>..." announcement -- confusing on the very first file (the
+   * only place a reader could ever actually see it as its own,
+   * distinct line, since bdone starts at exactly 0). receive_batch()
+   * credits real DATA chunks only, once it knows what it's counting. */
 
   *out_len = count;
   return 0;
@@ -549,6 +558,8 @@ static int send_batch(char **files, int nfiles)
         file_ok = 0;
         break;
       }
+      bdone += n;
+      if (verbose) stats();
     }
     if (file_ok && ferror(fp)) {
       fprintf(stderr, "%s: read error\n", path);
@@ -707,7 +718,12 @@ static int receive_batch(const char *dest_arg, int dest_is_dir)
 
       expecting_header = 0;
     } else {
-      /* data chunk */
+      /* data chunk -- credited/reported here, not in recv_chunk(),
+       * so a header's own payload bytes never show up as a
+       * "Kbytes transferred" line (see recv_chunk()'s own comment) */
+      bdone += len;
+      if (verbose) stats();
+
       if (!discarding && out) {
         if (fwrite(buf, 1, len, out) != len) {
           fprintf(stderr, "%s: write error\n", destpath);
@@ -751,7 +767,10 @@ Usage: max-xfr -s [-v] [-d <delay>] <file> [file...]\n\
             first file offered), or into the current directory\n\
             otherwise\n\
        -v:  verbose (statistics and per-file progress on stderr)\n\
-       -d:  delay in microseconds between bytes while sending\n");
+       -d:  delay in microseconds between bytes while sending, and\n\
+            before each ack byte while receiving (needed on some\n\
+            bit-banged links -- see the ack-pacing comments in\n\
+            send_chunk_ack()/recv_chunk() for why)\n");
   exit(1);
 }
 
