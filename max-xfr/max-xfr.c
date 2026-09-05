@@ -368,6 +368,14 @@ static int recv_chunk(uint8_t *buf, size_t bufcap, size_t *out_len)
 
   {
     uint8_t ack = 0xaa;
+    /* Paced the same as send_chunk_ack() below -- see its own comment
+     * for why: on a bit-banged receiver (ms.asm), f_bread locks onto
+     * whatever falling edge it sees first as the start bit, with no
+     * idle-time requirement of its own -- if OUR ack's start bit
+     * begins before the sender has even returned to its own listen
+     * call, the real start bit is missed entirely and a LATER bit
+     * transition gets mistaken for one instead, producing junk. */
+    if (delay) usleep(delay);
     if (write_all(&ack, 1) < 0) return -1;
   }
 
@@ -405,10 +413,40 @@ static int recv_chunk(uint8_t *buf, size_t bufcap, size_t *out_len)
  *	chunk recv_chunk() reported as "real" (return value 0) -- see this
  *	file's own header comment and recv_chunk()'s own for why that
  *	timing is the whole point.
+ *
+ *	Paced with "-d" before the byte goes out (2026-09-06, real
+ *	hardware bug on ms.asm's bit-banged receiver): this ack used to go
+ *	out completely unpaced, the one place in this whole protocol that
+ *	had no delay of any kind. Confirmed the actual mechanism directly
+ *	with the ms.asm author: f_bread (the bit-bang UART read routine)
+ *	recognizes a falling edge as a start bit immediately, with no
+ *	requirement that the line have been idle for any minimum time
+ *	first -- if our ack's own start bit has ALREADY begun by the time
+ *	the sender gets back around to calling f_bread (returning from its
+ *	own send loop, a few more instructions, then the call itself),
+ *	f_bread has nothing to catch; it simply hasn't started polling
+ *	yet. It then locks onto whichever LATER bit transition it sees
+ *	first as if that were the start bit, sampling at the wrong offset
+ *	for the rest of that byte -- explains a real hardware finding
+ *	exactly: a large (512-byte, the fullest single chunk this protocol
+ *	sends) payload's own ack reliably came back wrong even though the
+ *	payload itself was received correctly, while every smaller
+ *	chunk's ack (headers, sub-512-byte data) succeeded -- consistent
+ *	with the sender's own return-from-send-loop overhead only
+ *	occasionally landing on the wrong side of this race, not a random
+ *	glitch. (The opposite fix -- delaying the SENDER's own listen
+ *	instead of the receiver's ack -- was tried first and made things
+ *	uniformly worse, breaking every chunk instead of just the large
+ *	one: it only widens the same race rather than closing it.) This
+ *	fixes it at the true source of the timing mismatch: give the
+ *	sender time to get back to listening BEFORE we ever start sending
+ *	the ack, rather than trying to guess how long the sender itself
+ *	might need to wait.
  */
 static int send_chunk_ack(void)
 {
   uint8_t ack = 0xaa;
+  if (delay) usleep(delay);
   return write_all(&ack, 1);
 }
 
