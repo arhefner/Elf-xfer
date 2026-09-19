@@ -7,5 +7,7 @@
 *.o
 max-xfr
 !max-xfr/
+mem-xfr
+!mem-xfr/
 sertest
 !sertest/
