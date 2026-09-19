@@ -48,6 +48,10 @@ Mem-xfr and max-xfr do different jobs and speak different protocols; the split i
 
 `mem-xfr -s` sends all or part of a file to `loadbin`. `mem-xfr -r` receives a block of memory from `savebin`. `-x` says the local file is Intel hex rather than raw binary; it changes only how the file is read or written, never what goes over the wire.
 
+On input, `-x` reads data (`00`) and end-of-file (`01`) records, and skips the start-address records (`03` and `05`) that asm/02 emits to record a program's entry point -- `-v` reports that entry point rather than loading it, since it is where the monitor's `G` command would begin. Extended-address records (`02` and `04`) are accepted only when their base resolves to zero: the 1802 has no address space beyond 64K for a nonzero base to refer to. Any other record type is an error. On output, mem-xfr writes only data and end-of-file records.
+
+Gaps between records are preserved rather than filled. Sending `ledclock.hex`, for instance, transmits its 1174 bytes as nine separate blocks and leaves the 817 bytes of gap between them untouched on the 1802, so whatever already occupied those addresses survives the load.
+
 #### Addresses, offsets and lengths
 The three address-related options mean slightly different things in each direction, because the two routines divide the work differently.
 

@@ -406,10 +406,40 @@ static int load_hex(const char *path, unsigned long reloc)
     } else if (status == 1) {               /* end of file */
       saw_eof = 1;
       break;
+    } else if (status == 3 || status == 5) {
+      /* Start Segment/Linear Address: the program's entry point, which is
+       * metadata and carries no bytes to load. asm/02 emits a type 05 as a
+       * matter of course (several of the .hex files in these projects have
+       * one), so this is an ordinary record to skip past rather than an
+       * error -- rejecting it was a real bug. Worth echoing under -v, since
+       * it names the address the monitor's "G" command would start at. */
+      if (verbose) {
+        unsigned long entry = 0;
+
+        for (i = 0; i < n; i++) {
+          entry = (entry << 8) | (unsigned long)(bytes[i] & 0xff);
+        }
+        fprintf(stderr, "%s: entry point %04lxh (record type %02x, not "
+          "loaded)\n", path, entry & 0xffff, status);
+      }
+    } else if (status == 2 || status == 4) {
+      /* Extended Segment/Linear Address: these exist to address beyond 64K,
+       * which the 1802 has none of. A zero base is a harmless no-op and is
+       * accepted; a nonzero one would put every record after it outside the
+       * address space, so that is still refused. */
+      unsigned long base = 0;
+
+      for (i = 0; i < n; i++) {
+        base = (base << 8) | (unsigned long)(bytes[i] & 0xff);
+      }
+      if (base != 0) {
+        fprintf(stderr, "%s:%d: record type %02x sets a base address of "
+          "%lxh, outside the 1802's 64K address space\n", path, lineno,
+          status, base);
+        fclose(fp);
+        return -1;
+      }
     } else {
-      /* Segment/linear extended-address records describe an address space
-       * bigger than the 1802 has. Rejecting them beats loading their data
-       * at a silently wrong address. */
       fprintf(stderr, "%s:%d: unsupported Intel hex record type %02x\n",
         path, lineno, status);
       fclose(fp);
