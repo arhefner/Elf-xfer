@@ -192,6 +192,25 @@ def mock_savebin(w, address, data):
     return {"blocks": blocks, "gap_before_x": time.time() - t0}
 
 
+def mock_savebin_at_terminator(w, address, data, outpath):
+    """savebin, capturing the output file's state the instant 'x' arrives.
+
+    The closing 'x' must be the LAST thing mem-xfr does: the far end answers
+    it by returning, after which the monitor prints "done" and its prompt,
+    and those bytes are lost if mem-xfr is still holding the port (minicom
+    flushes when it takes the port back). So by the time this byte appears,
+    the output file must already be complete -- which is an ordering fact,
+    checkable without timing anything.
+    """
+    res = mock_savebin(w, address, data)
+    try:
+        with open(outpath, "rb") as fp:
+            res["file_at_terminator"] = fp.read()
+    except OSError:
+        res["file_at_terminator"] = None
+    return res
+
+
 def mock_savebin_trailing(w, address, data, trailer=b"done\r\n> "):
     """savebin, plus what the MONITOR prints once savebin has returned.
 
@@ -619,6 +638,34 @@ def main():
           b"done" in LAST_TRAILING,
           "still queued after exit = %r (empty means tty_reset flushed it)"
           % (LAST_TRAILING,))
+
+    print("=== receive: the terminator must be mem-xfr's LAST act ===")
+    # The far end answers the closing 'x' by returning, after which the
+    # monitor prints "done" and its ">" prompt. If mem-xfr is still busy when
+    # those arrive they queue as our unread input and are destroyed when
+    # minicom reclaims the port -- so being quick cannot help, only being
+    # last. The output file must therefore ALREADY be complete at the instant
+    # the 'x' goes out.
+    #
+    # That is an ordering fact, so assert it directly instead of timing
+    # anything: -x is used because store_hex finishes by writing the
+    # ":00000001FF" end record and closing the file, giving an unambiguous
+    # "this was done" marker to look for.
+    ordpath = p("order.hex")
+    if os.path.exists(ordpath):
+        os.unlink(ordpath)
+    rc, err, res, merr = run(["-r", "-x", "-d", "0", ordpath],
+                             mock_savebin_at_terminator,
+                             (0x0300, bytes(range(64)), ordpath),
+                             timeout=60)
+    check("terminator last: exit 0", rc == 0,
+          "rc=%r merr=%r err=%s" % (rc, merr, err.strip()))
+    if res:
+        at = res["file_at_terminator"]
+        check("terminator last: output file complete before 'x' is sent",
+              at is not None and b":00000001FF" in at,
+              "file at terminator = %r" %
+              (at if at is None else at[-40:],))
 
     print("=== exact block-size boundaries ===")
     for size, want in ((512, [(0x1000, 512)]),

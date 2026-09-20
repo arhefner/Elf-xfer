@@ -205,6 +205,47 @@ static void flush_wire(void)
 }
 
 /*
+ *	send_terminator: the session's closing 'x', which both loadbin and
+ *	savebin end by reading and requiring.
+ *
+ *	This MUST be the last thing we do before restoring the tty and
+ *	exiting -- nothing slow may come after it, and in particular not the
+ *	writing of the output file. The reason is that the far end responds to
+ *	this byte by returning from loadbin/savebin, after which the MONITOR
+ *	prints "done" and its ">" prompt. Those bytes are not ours; they
+ *	belong to whoever owns the port next (minicom). But while we still own
+ *	the port they land in our own unread input queue, and when minicom
+ *	reclaims the port it flushes -- so anything still queued at the
+ *	instant we exit is destroyed, no matter how we restore the tty.
+ *
+ *	Found on real hardware (2026-09-19), and the asymmetry is the proof:
+ *	-s sends this byte as its final act and loadbin's "done" appears
+ *	normally, while -r used to send it and then write the whole output
+ *	file before exiting -- and savebin's "done" vanished every time. Same
+ *	terminator, same exit path; the only difference was the file write
+ *	sitting in between. Switching tty_reset() from TCSAFLUSH to TCSADRAIN
+ *	(so WE at least stop discarding it) was necessary but not sufficient,
+ *	because minicom flushes as well.
+ *
+ *	So this is not a race that can be won by being quick. It is won by
+ *	being last: finish every slow thing first, then send the byte, then
+ *	get out, so the far end's reply arrives once minicom is reading again.
+ *	reply_byte (not send_byte) because this is still a byte we owe the far
+ *	end in answer to its $00 -- see BYTE PACING in this file's header.
+ */
+static int send_terminator(void)
+{
+  if (reply_byte(OVER) < 0) return -1;
+  flush_wire();
+
+  if (verbose) {
+    fprintf(stderr, "Terminator 'x' sent and flushed to the port.\n");
+    fflush(stderr);
+  }
+  return 0;
+}
+
+/*
  *	read_one_byte: read exactly one byte into *out, distinguishing a
  *	genuine timeout (tty_raw()'s own read timeout elapsed, read() returned
  *	0 and never touched the buffer) from a real read() failure. Reporting
@@ -671,29 +712,11 @@ static int recv_image(uint32_t *got_lo, uint32_t *got_hi)
     return -1;
   }
 
-  /* savebin's own last act is to read this and require it to be 'x'.
-   *
-   * reply_byte, NOT send_byte: this is a byte we owe the far end in answer
-   * to its $00, so it runs into exactly the same race as every other echo
-   * and ack in this direction. savebin sends the $00 with f_type and only
-   * then calls f_read; if our 'x' start bit has already begun by the time
-   * savebin gets inside f_read's polling loop, f_bread never sees it -- it
-   * is not queued anywhere -- and savebin hangs waiting for a byte that
-   * has already gone past.
-   *
-   * Found on real hardware (2026-09-19): -r transferred every data byte
-   * correctly and then savebin simply failed to return. This one site used
-   * send_byte (which delays AFTER writing) while every other reply in
-   * recv_image correctly used reply_byte (which delays BEFORE), so the 'x'
-   * went out with no lead-in at all. See this file's header comment on
-   * BYTE PACING for the full account of the two opposite races. */
-  if (reply_byte(OVER) < 0) return -1;
-  flush_wire();
-
-  if (verbose) {
-    fprintf(stderr, "\nTerminator 'x' sent and flushed to the port.\n");
-    fflush(stderr);
-  }
+  /* The closing 'x' is deliberately NOT sent here. savebin is now parked in
+   * f_read waiting for it, and it stays parked as long as we like -- which
+   * lets main() finish writing the output file FIRST and send the byte as
+   * its very last act. See send_terminator() for why that ordering is the
+   * whole point. */
 
   return 0;
 }
@@ -1032,12 +1055,18 @@ int main(int argc, char **argv)
     }
   } else {
     uint32_t got_lo = 0, got_hi = 0;
+    int got_end;
 
     if (verbose) {
       fprintf(stderr, _("Receiving into %s\n"), file);
       fflush(stderr);
     }
     ret = recv_image(&got_lo, &got_hi);
+
+    /* Whether we got as far as savebin's $00. If we did, it is now waiting
+     * on the closing 'x' and we owe it that byte even if our own local work
+     * below fails -- otherwise it waits forever. */
+    got_end = (ret == 0);
 
     /* -a and -l are assertions on this side: savebin's own start address
      * and byte count come from the monitor's "S <start> <end>", so this
@@ -1065,6 +1094,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "\nReceived %lu bytes (%04xh..%04xh) into %s\n",
           (unsigned long)(got_hi - got_lo), got_lo, got_hi - 1, file);
       }
+    }
+
+    /* LAST act, after the output file is completely written and closed --
+     * see send_terminator() for why nothing slow may follow it. Sent even
+     * when the work above failed, so the far end is never left hanging. */
+    if (got_end) {
+      if (send_terminator() < 0 && ret == 0) ret = -1;
     }
   }
 
