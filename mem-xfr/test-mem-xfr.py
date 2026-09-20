@@ -634,18 +634,18 @@ def main():
                              timeout=60, catch_trailing=True)
     check("closing output: exit 0", rc == 0,
           "rc=%r merr=%r err=%s" % (rc, merr, err.strip()))
-    # mem-xfr now READS the far end's closing output itself and echoes it,
-    # rather than leaving it queued for whoever takes the port back. It has
-    # to: those bytes arrive within a millisecond or two of the terminator,
-    # while minicom needs far longer to resume, and it flushes the port when
-    # it does -- a race that cannot be won from here, only sidestepped. So
-    # the invariant is "mem-xfr showed it", not "mem-xfr left it alone".
-    check("closing output: the far end's 'done' is echoed to stderr",
-          "done" in err,
-          "stderr = %r" % (err.strip(),))
-    check("closing output: nothing left stranded on the port",
-          b"done" not in LAST_TRAILING,
-          "still queued after exit = %r (should be consumed now)"
+    # The far end's closing output belongs to whoever owns the port next --
+    # under minicom, that is minicom, which puts it on the terminal screen
+    # where it belongs. mem-xfr must therefore neither consume it nor discard
+    # it. tty_reset() used TCSAFLUSH, which discards unread input, and ate it.
+    #
+    # An earlier attempt had mem-xfr read these bytes itself and echo them to
+    # stderr, to sidestep a race it turned out not to be losing. The real bug
+    # was the terminator not being sent last; with that fixed the bytes reach
+    # minicom on their own, so the invariant is back to "leave them alone".
+    check("closing output: the far end's 'done' is left for the next owner",
+          b"done" in LAST_TRAILING,
+          "still queued after exit = %r (empty means we ate or flushed it)"
           % (LAST_TRAILING,))
 
     print("=== receive: the terminator must be mem-xfr's LAST act ===")

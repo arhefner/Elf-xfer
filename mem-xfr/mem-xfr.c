@@ -185,15 +185,15 @@ static int reply_byte(uint8_t b)
  *	flush_wire: block until every byte written so far has physically left
  *	the port, rather than merely sitting in the kernel's output queue.
  *
- *	Called after the session's final 'x', where it matters most: the far
- *	end is parked in f_read waiting for exactly that byte, and without
- *	this the moment it reaches the wire depends on unrelated work. In the
- *	receive path the 'x' used to be queued and then left there while we
- *	wrote the output FILE, only getting drained later as a side effect of
- *	tty_reset()'s TCSAFLUSH -- an unbounded delay for the one byte the
- *	1802 is actively blocked on, and a needless dependency on the exit
- *	path behaving. Draining explicitly makes delivery a thing this code
- *	does on purpose, at a known point.
+ *	Used by the send path, after its closing $00 and 'x': loadbin is parked
+ *	in f_read waiting for that byte, so it is worth making delivery
+ *	something this code does on purpose at a known point, rather than
+ *	leaving the moment it reaches the wire to depend on unrelated work.
+ *
+ *	The receive path does NOT use this. Its terminator is the last thing
+ *	main() does before returning, so there is nothing left afterwards that
+ *	a drain could reorder -- and draining there would only delay our exit,
+ *	which is precisely what must stay short.
  */
 static void flush_wire(void)
 {
@@ -202,144 +202,6 @@ static void flush_wire(void)
     break;                      /* not a tty, or cannot drain -- nothing
                                  * useful to do about it here */
   }
-}
-
-/*
- *	send_terminator: the session's closing 'x', which both loadbin and
- *	savebin end by reading and requiring.
- *
- *	This MUST be the last thing we do before restoring the tty and
- *	exiting -- nothing slow may come after it, and in particular not the
- *	writing of the output file. The reason is that the far end responds to
- *	this byte by returning from loadbin/savebin, after which the MONITOR
- *	prints "done" and its ">" prompt. Those bytes are not ours; they
- *	belong to whoever owns the port next (minicom). But while we still own
- *	the port they land in our own unread input queue, and when minicom
- *	reclaims the port it flushes -- so anything still queued at the
- *	instant we exit is destroyed, no matter how we restore the tty.
- *
- *	Found on real hardware (2026-09-19), and the asymmetry is the proof:
- *	-s sends this byte as its final act and loadbin's "done" appears
- *	normally, while -r used to send it and then write the whole output
- *	file before exiting -- and savebin's "done" vanished every time. Same
- *	terminator, same exit path; the only difference was the file write
- *	sitting in between. Switching tty_reset() from TCSAFLUSH to TCSADRAIN
- *	(so WE at least stop discarding it) was necessary but not sufficient,
- *	because minicom flushes as well.
- *
- *	So this is not a race that can be won by being quick. It is won by
- *	being last: finish every slow thing first, then send the byte, then
- *	get out, so the far end's reply arrives once minicom is reading again.
- *	reply_byte (not send_byte) because this is still a byte we owe the far
- *	end in answer to its $00 -- see BYTE PACING in this file's header.
- */
-static int send_terminator(void)
-{
-  /* Announced BEFORE the byte goes out, so that nothing at all -- not even
-   * this stderr write -- sits between the terminator and our reading of
-   * whatever the far end says in reply. */
-  if (verbose) {
-    fprintf(stderr, "Sending terminator 'x'...\n");
-    fflush(stderr);
-  }
-
-  if (reply_byte(OVER) < 0) return -1;
-  flush_wire();
-  return 0;
-}
-
-/*
- *	drain_closing_output: read whatever the far end sends after the
- *	terminator and echo it to stderr.
- *
- *	This exists because the closing output cannot be left to chance. The
- *	far end answers the terminator by returning from savebin, after which
- *	the monitor prints "done" and its ">" prompt. Those bytes belong to
- *	whoever holds the port next, and minicom flushes the port when it
- *	reclaims it -- so on a receive that output was simply never seen.
- *
- *	Two earlier attempts failed. TCSADRAIN in tty_reset() (9f8a1d6)
- *	stopped US discarding the bytes, but could not stop minicom. Deferring
- *	the terminator to our very last act (dbc97fe) shortened our own tail,
- *	which turned out not to be the problem.
- *
- *	Worth recording precisely, because the obvious diagnosis is wrong: we
- *	are NOT too slow to get out of the way. Measured on the host, mem-xfr
- *	exits 0.24-0.47ms after writing the terminator (worst case seen
- *	1.2ms), while at 19200 baud the first byte of "done" cannot arrive
- *	until ~1.0ms and the whole "done\r\n> " takes ~4.7ms. We usually are
- *	gone before the reply even begins. What decides it is the far side of
- *	the gap: minicom needs far longer than a few milliseconds to notice
- *	the child exited, tear down the redirection and start reading again,
- *	and it flushes when it does. The real-world symptom was consistent,
- *	never intermittent, which is the evidence for that -- a mere 0.3ms
- *	versus 1.0ms race would have succeeded most of the time.
- *
- *	So don't race: read the bytes ourselves, deterministically, while we
- *	still own the port, and print them. They show up in minicom's transfer
- *	window instead of on the terminal screen, which is a fair trade for
- *	their appearing at all. A short VTIME is used just for this, since the
- *	protocol's own 25.5s timeout would stall the exit; the far end's whole
- *	closing message is only a handful of bytes and arrives immediately.
- *
- *	Applied on receive only. A send's closing output already survives, and
- *	moving it into the transfer window to match would be a change for its
- *	own sake.
- */
-static void drain_closing_output(void)
-{
-  struct termios saved, quick;
-  uint8_t buf[128];
-  size_t total = 0;
-  int restore = 0;
-  int prev = -1, cur = -1;              /* last two bytes seen, across reads */
-
-  /* VTIME is tenths of a second, so 1 is as short as a timeout can be set.
-   * It is only the backstop: the loop below normally stops the moment the
-   * monitor's prompt arrives, a few milliseconds in.
-   *
-   * The first version of this used VTIME=3 and stopped only on the timeout,
-   * which cost ~342ms on EVERY receive -- and paid it whether the far end
-   * replied or not (measured 342.3ms with a reply, 342.5ms without), since
-   * the loop always sat out the full timeout after the last byte. The whole
-   * closing message is ~4.7ms of wire time at 19200 baud, so that was three
-   * hundred milliseconds of pure waiting for nothing. */
-  if (tcgetattr(ttyfd, &saved) == 0) {
-    quick = saved;
-    quick.c_cc[VMIN] = 0;
-    quick.c_cc[VTIME] = 1;              /* 100ms backstop */
-    if (tcsetattr(ttyfd, TCSANOW, &quick) == 0) restore = 1;
-  }
-
-  while (total < 512) {
-    ssize_t n = read(STDIN_FILENO, buf, sizeof buf);
-
-    if (n <= 0) break;                  /* idle timeout, or nothing coming */
-    fwrite(buf, 1, (size_t)n, stderr);
-    total += (size_t)n;
-
-    /* Track the last two bytes seen, across reads. */
-    if (n >= 2) {
-      prev = buf[n - 2];
-      cur = buf[n - 1];
-    } else {
-      prev = cur;
-      cur = buf[0];
-    }
-
-    /* The monitor ends by printing its "> " prompt, so once that lands
-     * there is nothing further to wait for. Purely a fast path -- if the
-     * prompt ever changes this just falls back to the timeout above, which
-     * is what actually bounds the wait. */
-    if (prev == '>' && cur == ' ') break;
-  }
-
-  if (total) {
-    fputc('\n', stderr);
-    fflush(stderr);
-  }
-
-  if (restore) tcsetattr(ttyfd, TCSANOW, &saved);
 }
 
 /*
@@ -811,9 +673,9 @@ static int recv_image(uint32_t *got_lo, uint32_t *got_hi)
 
   /* The closing 'x' is deliberately NOT sent here. savebin is now parked in
    * f_read waiting for it, and it stays parked as long as we like -- which
-   * lets main() finish writing the output file FIRST and send the byte
-   * afterwards, then read the far end's reply. See send_terminator() and
-   * drain_closing_output(). */
+   * lets main() finish the output file, restore the tty, print its last
+   * diagnostics, and only then send the byte as its very final act. See the
+   * comment at that write in main() for why the ordering matters. */
 
   return 0;
 }
@@ -953,20 +815,15 @@ void fatal(char *message)
  * arrived and not been read -- and by this point that input is precisely the
  * far end's own post-transfer output, which we must not touch.
  *
- * Found on real hardware (2026-09-19). A receive worked perfectly, savebin
- * returned, and the monitor went back to its prompt -- but its "done" and
- * the following ">" never appeared on screen. The order of events:
- *
- *   1. we write the final 'x' and drain it
- *   2. we then write the whole output FILE (store_hex walks all 65536
- *      addresses), still owning the port and not reading from it
- *   3. the 1802 meanwhile returns from savebin and sends "done\r\n> ",
- *      which queues up as our unread input
- *   4. tty_reset() runs TCSAFLUSH and discards it
- *
- * So the bytes were not lost in minicom's teardown; we threw them away
- * ourselves, just before handing the port back. Draining instead of
- * flushing leaves them queued for whoever owns the port next.
+ * Found on real hardware (2026-09-19), while chasing a receive whose "done"
+ * and ">" never reached the screen. That symptom turned out to have a
+ * different root cause -- the terminator was not being sent last, so the
+ * far end replied while we were still finishing up -- and is fixed at that
+ * write in main(). But flushing here was a real second fault behind it: any
+ * output the far end has already sent and we have not read is ours to hand
+ * on, not to destroy, and TCSAFLUSH destroyed it. TCSADRAIN waits for our
+ * own output exactly as TCSAFLUSH does, and simply leaves the input queue
+ * alone for whoever owns the port next.
  *
  * tty_raw() deliberately keeps TCSAFLUSH: discarding whatever was already
  * on the line *before* a transfer starts is wanted (it is what quietly eats
@@ -1045,6 +902,7 @@ int main(int argc, char **argv)
   unsigned long addr = 0, off = 0, len = 0;
   const char *file;
   uint32_t win_lo = 0, win_hi = 0;
+  int send_terminator = 0;
   int ret;
 
   while ((c = getopt(argc, argv, "a:d:l:o:rsvx")) != EOF) {
@@ -1152,7 +1010,6 @@ int main(int argc, char **argv)
     }
   } else {
     uint32_t got_lo = 0, got_hi = 0;
-    int got_end;
 
     if (verbose) {
       fprintf(stderr, _("Receiving into %s\n"), file);
@@ -1163,7 +1020,7 @@ int main(int argc, char **argv)
     /* Whether we got as far as savebin's $00. If we did, it is now waiting
      * on the closing 'x' and we owe it that byte even if our own local work
      * below fails -- otherwise it waits forever. */
-    got_end = (ret == 0);
+    send_terminator = (ret == 0);
 
     /* -a and -l are assertions on this side: savebin's own start address
      * and byte count come from the monitor's "S <start> <end>", so this
@@ -1192,17 +1049,6 @@ int main(int argc, char **argv)
           (unsigned long)(got_hi - got_lo), got_lo, got_hi - 1, file);
       }
     }
-
-    /* LAST act, after the output file is completely written and closed --
-     * see send_terminator() for why nothing slow may follow it. Sent even
-     * when the work above failed, so the far end is never left hanging. */
-    if (got_end) {
-      if (send_terminator() < 0 && ret == 0) ret = -1;
-
-      /* Read the far end's own closing output rather than leaving it for
-       * minicom to flush away -- see drain_closing_output(). */
-      drain_closing_output();
-    }
   }
 
   tty_reset();
@@ -1210,6 +1056,23 @@ int main(int argc, char **argv)
   if (verbose) {
     fprintf(stderr, _("... Done.\n"));
     fflush(stderr);
+  }
+
+  /* LAST act: after the output file is written and closed, after the tty is
+   * restored, after every last diagnostic. The far end answers this byte by
+   * returning, whereupon the monitor prints "done" and its ">" prompt -- and
+   * those bytes only reach the screen if we are already out of the way, so
+   * nothing whatsoever may follow this.
+   *
+   * reply_byte, not a bare write(): it is still a byte we owe the far end in
+   * answer to its $00, so it keeps the -d lead-in that a bit-banged UART
+   * needs (see BYTE PACING in this file's header, and max-xfr's 7da8310).
+   * The lead-in costs nothing here -- it delays the far end's reply by the
+   * same amount it delays the byte, while our exit still follows the write
+   * immediately, so the gap that actually mattered is unchanged. It also
+   * brings EINTR and short-write handling, via write_all. */
+  if (send_terminator) {
+    if (reply_byte(OVER) < 0) ret = -1;
   }
 
   return ret < 0 ? 1 : 0;
