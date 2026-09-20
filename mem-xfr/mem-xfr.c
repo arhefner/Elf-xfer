@@ -182,6 +182,29 @@ static int reply_byte(uint8_t b)
 }
 
 /*
+ *	flush_wire: block until every byte written so far has physically left
+ *	the port, rather than merely sitting in the kernel's output queue.
+ *
+ *	Called after the session's final 'x', where it matters most: the far
+ *	end is parked in f_read waiting for exactly that byte, and without
+ *	this the moment it reaches the wire depends on unrelated work. In the
+ *	receive path the 'x' used to be queued and then left there while we
+ *	wrote the output FILE, only getting drained later as a side effect of
+ *	tty_reset()'s TCSAFLUSH -- an unbounded delay for the one byte the
+ *	1802 is actively blocked on, and a needless dependency on the exit
+ *	path behaving. Draining explicitly makes delivery a thing this code
+ *	does on purpose, at a known point.
+ */
+static void flush_wire(void)
+{
+  while (tcdrain(STDOUT_FILENO) < 0) {
+    if (errno == EINTR) continue;
+    break;                      /* not a tty, or cannot drain -- nothing
+                                 * useful to do about it here */
+  }
+}
+
+/*
  *	read_one_byte: read exactly one byte into *out, distinguishing a
  *	genuine timeout (tty_raw()'s own read timeout elapsed, read() returned
  *	0 and never touched the buffer) from a real read() failure. Reporting
@@ -549,6 +572,7 @@ static int send_image(uint32_t win_lo, uint32_t win_hi)
    * DF clear. Neither is echoed. */
   if (send_byte(CMD_END) < 0) return -1;
   if (send_byte(OVER) < 0) return -1;
+  flush_wire();
 
   return 0;
 }
@@ -664,6 +688,12 @@ static int recv_image(uint32_t *got_lo, uint32_t *got_hi)
    * went out with no lead-in at all. See this file's header comment on
    * BYTE PACING for the full account of the two opposite races. */
   if (reply_byte(OVER) < 0) return -1;
+  flush_wire();
+
+  if (verbose) {
+    fprintf(stderr, "\nTerminator 'x' sent and flushed to the port.\n");
+    fflush(stderr);
+  }
 
   return 0;
 }
