@@ -192,14 +192,44 @@ def mock_savebin(w, address, data):
     return {"blocks": blocks, "gap_before_x": time.time() - t0}
 
 
-def run(args, mock, mockargs=(), timeout=25):
-    """Run mem-xfr with stdin/stdout on a pty; drive `mock` from the parent."""
+def mock_savebin_trailing(w, address, data, trailer=b"done\r\n> "):
+    """savebin, plus what the MONITOR prints once savebin has returned.
+
+    s_cmd emits "done" and then the ">" prompt after savebin returns, which
+    happens while mem-xfr is still finishing up and still owns the port. Those
+    bytes belong to whoever takes the port back (minicom), and mem-xfr must
+    not consume or discard them.
+    """
+    res = mock_savebin(w, address, data)
+    w.w(trailer)
+    res["trailer"] = trailer
+    return res
+
+
+# Whatever was still queued on the slave side after mem-xfr exited, for the
+# most recent run(..., catch_trailing=True). See that test for why.
+LAST_TRAILING = b""
+
+
+def run(args, mock, mockargs=(), timeout=25, catch_trailing=False):
+    """Run mem-xfr with stdin/stdout on a pty; drive `mock` from the parent.
+
+    catch_trailing keeps a second descriptor open on the slave so that bytes
+    the far end sent near the end of the session can be read back AFTER
+    mem-xfr has exited -- which is what minicom does, holding the port while
+    handing it to a transfer program. Without a second holder there is no
+    way to tell "mem-xfr discarded it" from "the pty went away with it".
+    """
+    global LAST_TRAILING
+
+    LAST_TRAILING = b""
     master, slave = pty.openpty()
     tty.setraw(slave)
     tty.setraw(master)
 
     proc = subprocess.Popen([MEMXFR] + args, stdin=slave, stdout=slave,
                             stderr=subprocess.PIPE)
+    keep = os.dup(slave) if catch_trailing else None
     os.close(slave)
 
     w = Wire(master)
@@ -219,6 +249,23 @@ def run(args, mock, mockargs=(), timeout=25):
 
     stderr = proc.stderr.read().decode(errors="replace")
     proc.stderr.close()
+
+    if keep is not None:
+        # Read whatever is still queued on the slave now that mem-xfr has
+        # gone. If its tty_reset() flushed the input queue, this is empty.
+        try:
+            while True:
+                r, _, _ = select.select([keep], [], [], 0.3)
+                if not r:
+                    break
+                chunk = os.read(keep, 4096)
+                if not chunk:
+                    break
+                LAST_TRAILING += chunk
+        except OSError:
+            pass
+        os.close(keep)
+
     os.close(master)
     return proc.returncode, stderr, result, mock_err
 
@@ -549,6 +596,29 @@ def main():
         check("paced 'x': preceded by an idle gap of about -d", gap >= want,
               "gap was %.5fs, wanted >= %.5fs (the fault shows as ~0)" %
               (gap, want))
+
+    print("=== receive: the far end's closing output must survive our exit ===")
+    # Regression test for a real hardware symptom: a receive worked, savebin
+    # returned and the monitor went back to its prompt, but the monitor's
+    # "done" and ">" never appeared on screen. tty_reset() used TCSAFLUSH,
+    # which discards unread input -- and by that point the unread input was
+    # exactly those bytes. mem-xfr was eating the far end's closing output
+    # itself, just before handing the port back.
+    #
+    # -x is deliberate: store_hex walks all 65536 addresses, which reliably
+    # keeps mem-xfr busy long enough for the trailer to land BEFORE
+    # tty_reset() runs. With a small binary payload the window is too tight
+    # for the test to mean anything.
+    rc, err, res, merr = run(["-r", "-x", "-d", "0", p("trail.hex")],
+                             mock_savebin_trailing,
+                             (0x0300, bytes(range(64))),
+                             timeout=60, catch_trailing=True)
+    check("closing output: exit 0", rc == 0,
+          "rc=%r merr=%r err=%s" % (rc, merr, err.strip()))
+    check("closing output: the far end's 'done' is not discarded",
+          b"done" in LAST_TRAILING,
+          "still queued after exit = %r (empty means tty_reset flushed it)"
+          % (LAST_TRAILING,))
 
     print("=== exact block-size boundaries ===")
     for size, want in ((512, [(0x1000, 512)]),

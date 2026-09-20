@@ -828,10 +828,34 @@ void fatal(char *message)
 /* reset tty - useful also for restoring the terminal when this process
    wishes to temporarily relinquish the tty
 */
+/* Restore the tty. TCSADRAIN, *not* TCSAFLUSH: both wait for our own output
+ * to be transmitted, but TCSAFLUSH additionally DISCARDS any input that has
+ * arrived and not been read -- and by this point that input is precisely the
+ * far end's own post-transfer output, which we must not touch.
+ *
+ * Found on real hardware (2026-09-19). A receive worked perfectly, savebin
+ * returned, and the monitor went back to its prompt -- but its "done" and
+ * the following ">" never appeared on screen. The order of events:
+ *
+ *   1. we write the final 'x' and drain it
+ *   2. we then write the whole output FILE (store_hex walks all 65536
+ *      addresses), still owning the port and not reading from it
+ *   3. the 1802 meanwhile returns from savebin and sends "done\r\n> ",
+ *      which queues up as our unread input
+ *   4. tty_reset() runs TCSAFLUSH and discards it
+ *
+ * So the bytes were not lost in minicom's teardown; we threw them away
+ * ourselves, just before handing the port back. Draining instead of
+ * flushing leaves them queued for whoever owns the port next.
+ *
+ * tty_raw() deliberately keeps TCSAFLUSH: discarding whatever was already
+ * on the line *before* a transfer starts is wanted (it is what quietly eats
+ * the monitor's own "Start receive..." text, among other things).
+ */
 int tty_reset(void)
 {
-    /* flush and reset */
-    if (tcsetattr(ttyfd,TCSAFLUSH,&orig_termios) == 0)
+    /* drain our output, but leave the far end's input queued */
+    if (tcsetattr(ttyfd,TCSADRAIN,&orig_termios) == 0)
     {
       raw_mode = 0;
       return 0;
