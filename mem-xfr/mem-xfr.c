@@ -647,8 +647,23 @@ static int recv_image(uint32_t *got_lo, uint32_t *got_hi)
     return -1;
   }
 
-  /* savebin's own last act is to read this and require it to be 'x'. */
-  if (send_byte(OVER) < 0) return -1;
+  /* savebin's own last act is to read this and require it to be 'x'.
+   *
+   * reply_byte, NOT send_byte: this is a byte we owe the far end in answer
+   * to its $00, so it runs into exactly the same race as every other echo
+   * and ack in this direction. savebin sends the $00 with f_type and only
+   * then calls f_read; if our 'x' start bit has already begun by the time
+   * savebin gets inside f_read's polling loop, f_bread never sees it -- it
+   * is not queued anywhere -- and savebin hangs waiting for a byte that
+   * has already gone past.
+   *
+   * Found on real hardware (2026-09-19): -r transferred every data byte
+   * correctly and then savebin simply failed to return. This one site used
+   * send_byte (which delays AFTER writing) while every other reply in
+   * recv_image correctly used reply_byte (which delays BEFORE), so the 'x'
+   * went out with no lead-in at all. See this file's header comment on
+   * BYTE PACING for the full account of the two opposite races. */
+  if (reply_byte(OVER) < 0) return -1;
 
   return 0;
 }
