@@ -634,9 +634,18 @@ def main():
                              timeout=60, catch_trailing=True)
     check("closing output: exit 0", rc == 0,
           "rc=%r merr=%r err=%s" % (rc, merr, err.strip()))
-    check("closing output: the far end's 'done' is not discarded",
-          b"done" in LAST_TRAILING,
-          "still queued after exit = %r (empty means tty_reset flushed it)"
+    # mem-xfr now READS the far end's closing output itself and echoes it,
+    # rather than leaving it queued for whoever takes the port back. It has
+    # to: those bytes arrive within a millisecond or two of the terminator,
+    # while minicom needs far longer to resume, and it flushes the port when
+    # it does -- a race that cannot be won from here, only sidestepped. So
+    # the invariant is "mem-xfr showed it", not "mem-xfr left it alone".
+    check("closing output: the far end's 'done' is echoed to stderr",
+          "done" in err,
+          "stderr = %r" % (err.strip(),))
+    check("closing output: nothing left stranded on the port",
+          b"done" not in LAST_TRAILING,
+          "still queued after exit = %r (should be consumed now)"
           % (LAST_TRAILING,))
 
     print("=== receive: the terminator must be mem-xfr's LAST act ===")
