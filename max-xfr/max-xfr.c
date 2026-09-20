@@ -784,10 +784,20 @@ void fatal(char *message)
 /* reset tty - useful also for restoring the terminal when this process
    wishes to temporarily relinquish the tty
 */
+/* Restore the tty. TCSADRAIN, *not* TCSAFLUSH: both wait for our own output
+ * to be transmitted, but TCSAFLUSH additionally DISCARDS any input that has
+ * arrived and not been read -- and at this point that input is whatever the
+ * far end has sent since our last read, typically MR/MS's own closing
+ * output. Those bytes belong to whoever owns the port next (minicom, which
+ * displays them); destroying them here is not ours to do.
+ *
+ * Found in mem-xfr (2026-09-19) and carried back: this tool has the same
+ * teardown and the same fault. tty_raw() deliberately keeps TCSAFLUSH --
+ * discarding whatever was on the line BEFORE a transfer starts is wanted. */
 int tty_reset(void)
 {
-    /* flush and reset */
-    if (tcsetattr(ttyfd,TCSAFLUSH,&orig_termios) == 0)
+    /* drain our output, but leave the far end's input queued */
+    if (tcsetattr(ttyfd,TCSADRAIN,&orig_termios) == 0)
     {
       raw_mode = 0;
       return 0;
@@ -931,12 +941,22 @@ int main(int argc, char **argv)
 
   tty_reset();
 
-  write(STDOUT_FILENO, &over, 1);
-
   if (verbose) {
     fprintf(stderr, _("... Done.\n"));
     fflush(stderr);
   }
+
+  /* LAST act, after everything else including the diagnostics. The far end
+   * answers this byte by returning, whereupon it prints its own completion
+   * message -- which only reaches the screen if we are already out of the
+   * way, so nothing may follow this write. (Confirmed on hardware via
+   * mem-xfr, 2026-09-19; this used to sit ahead of the "... Done." line.)
+   *
+   * Paced with -d for the same reason every other byte is: a bit-banged UART
+   * on the far end has no hold register, and must already be inside its own
+   * receive loop when the start bit arrives. */
+  if (delay) usleep(delay);
+  write_all(&over, 1);
 
   return ret < 0 ? 1 : 0;
 }

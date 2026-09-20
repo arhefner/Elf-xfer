@@ -167,9 +167,20 @@ static void fatal(const char *message)
   exit(1);
 }
 
+/* Restore the tty. TCSADRAIN, *not* TCSAFLUSH: both wait for our own output
+ * to be transmitted, but TCSAFLUSH additionally DISCARDS any input that has
+ * arrived and not been read. For a diagnostic tool that is exactly the wrong
+ * thing to do -- anything the far end sent after do_recv() stopped reading
+ * (or while do_send() was writing) is evidence, and it belongs to whoever
+ * owns the port next rather than in the bin.
+ *
+ * Found in mem-xfr (2026-09-19) and carried back; all three tools here had
+ * the same teardown. tty_raw() deliberately keeps TCSAFLUSH, since
+ * discarding stale input BEFORE a test starts is wanted. */
 static int tty_reset(void)
 {
-  if (tcsetattr(ttyfd, TCSAFLUSH, &orig_termios) == 0) {
+  /* drain our output, but leave the far end's input queued */
+  if (tcsetattr(ttyfd, TCSADRAIN, &orig_termios) == 0) {
     raw_mode = 0;
     return 0;
   }
