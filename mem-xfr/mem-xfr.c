@@ -254,18 +254,26 @@ static int send_terminator(void)
  *
  *	This exists because the closing output cannot be left to chance. The
  *	far end answers the terminator by returning from savebin, after which
- *	the monitor prints "done" and its ">" prompt -- and those bytes arrive
- *	within a millisecond or two, while minicom needs far longer to notice
- *	our exit, tear down the redirection and start reading the port again.
- *	Whatever is queued when it reclaims the port gets flushed away, so on
- *	a receive that output was simply never seen.
+ *	the monitor prints "done" and its ">" prompt. Those bytes belong to
+ *	whoever holds the port next, and minicom flushes the port when it
+ *	reclaims it -- so on a receive that output was simply never seen.
  *
- *	Two earlier attempts tried to win that race and could not: TCSADRAIN
- *	in tty_reset() (9f8a1d6) stopped US discarding the bytes but not
- *	minicom, and deferring the terminator to the very last act (dbc97fe)
- *	shortened our own tail but the race was never ours to win -- the gap
- *	that matters is between our exit and minicom's resumption, which we
- *	have no control over at all.
+ *	Two earlier attempts failed. TCSADRAIN in tty_reset() (9f8a1d6)
+ *	stopped US discarding the bytes, but could not stop minicom. Deferring
+ *	the terminator to our very last act (dbc97fe) shortened our own tail,
+ *	which turned out not to be the problem.
+ *
+ *	Worth recording precisely, because the obvious diagnosis is wrong: we
+ *	are NOT too slow to get out of the way. Measured on the host, mem-xfr
+ *	exits 0.24-0.47ms after writing the terminator (worst case seen
+ *	1.2ms), while at 19200 baud the first byte of "done" cannot arrive
+ *	until ~1.0ms and the whole "done\r\n> " takes ~4.7ms. We usually are
+ *	gone before the reply even begins. What decides it is the far side of
+ *	the gap: minicom needs far longer than a few milliseconds to notice
+ *	the child exited, tear down the redirection and start reading again,
+ *	and it flushes when it does. The real-world symptom was consistent,
+ *	never intermittent, which is the evidence for that -- a mere 0.3ms
+ *	versus 1.0ms race would have succeeded most of the time.
  *
  *	So don't race: read the bytes ourselves, deterministically, while we
  *	still own the port, and print them. They show up in minicom's transfer
@@ -284,11 +292,22 @@ static void drain_closing_output(void)
   uint8_t buf[128];
   size_t total = 0;
   int restore = 0;
+  int prev = -1, cur = -1;              /* last two bytes seen, across reads */
 
+  /* VTIME is tenths of a second, so 1 is as short as a timeout can be set.
+   * It is only the backstop: the loop below normally stops the moment the
+   * monitor's prompt arrives, a few milliseconds in.
+   *
+   * The first version of this used VTIME=3 and stopped only on the timeout,
+   * which cost ~342ms on EVERY receive -- and paid it whether the far end
+   * replied or not (measured 342.3ms with a reply, 342.5ms without), since
+   * the loop always sat out the full timeout after the last byte. The whole
+   * closing message is ~4.7ms of wire time at 19200 baud, so that was three
+   * hundred milliseconds of pure waiting for nothing. */
   if (tcgetattr(ttyfd, &saved) == 0) {
     quick = saved;
     quick.c_cc[VMIN] = 0;
-    quick.c_cc[VTIME] = 3;              /* 300ms; "done\r\n> " needs ~4ms */
+    quick.c_cc[VTIME] = 1;              /* 100ms backstop */
     if (tcsetattr(ttyfd, TCSANOW, &quick) == 0) restore = 1;
   }
 
@@ -298,6 +317,21 @@ static void drain_closing_output(void)
     if (n <= 0) break;                  /* idle timeout, or nothing coming */
     fwrite(buf, 1, (size_t)n, stderr);
     total += (size_t)n;
+
+    /* Track the last two bytes seen, across reads. */
+    if (n >= 2) {
+      prev = buf[n - 2];
+      cur = buf[n - 1];
+    } else {
+      prev = cur;
+      cur = buf[0];
+    }
+
+    /* The monitor ends by printing its "> " prompt, so once that lands
+     * there is nothing further to wait for. Purely a fast path -- if the
+     * prompt ever changes this just falls back to the timeout above, which
+     * is what actually bounds the wait. */
+    if (prev == '>' && cur == ' ') break;
   }
 
   if (total) {
