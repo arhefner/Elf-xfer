@@ -5,6 +5,7 @@
 *.hex
 *.elfos
 *.o
+__pycache__/
 max-xfr
 !max-xfr/
 mem-xfr
