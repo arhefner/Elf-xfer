@@ -107,6 +107,12 @@ and to finish:              and to finish:
 ```
 
 Each byte of the 5-byte block header is echoed back and verified; the data bytes are not echoed, and are covered only by the single `$AA` that follows the block. Blocks are capped at 512 bytes, matching `savebin`'s own block size. A count of zero never appears in a header: `$00` in the command position is the end marker, and the 1802 side counts with the `UNTL` macro, which would treat a count of zero as 65536.
+### Tests
+`make test` runs a protocol test suite against Python mocks of `loadbin` and `savebin` transcribed from `max_mon.asm`. It needs no 1802 and no serial hardware -- it puts mem-xfr on one end of a pty and drives the other end itself -- so it runs anywhere the tool builds.
+
+Testing against those mocks matters more than running mem-xfr against its own opposite mode would: a self round trip passes just as happily with the handshake inverted on both sides, so only a peer that independently implements what the 1802 actually does can confirm the wire format is right.
+
+A few of the checks assert on *timing* rather than on bytes, which is deliberate. A pty has none of a bit-banged UART's timing, so a reply byte sent without its `-d` lead-in still arrives perfectly intact over a pty while being lost outright on real hardware -- which is exactly how the terminating `'x'` of a receive once shipped unpaced, hanging `savebin`. The idle gap before that byte is therefore measured and asserted directly. Anything new that mem-xfr sends *in reply* to the far end deserves the same treatment.
 ### Usage with minicom
 As with max-xfr, these can be added as minicom file transfer protocols, for example:
 
