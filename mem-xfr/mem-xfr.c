@@ -112,7 +112,7 @@ static unsigned long bdone = 0;
 static struct termios orig_termios;  /* TERMinal I/O Structure */
 static int ttyfd = STDIN_FILENO;     /* STDIN_FILENO is 0 by default */
 
-static int delay = 130;              /* Default value for 57.6k hw UART */
+static int delay = 200;              /* Default value for 57.6k hw UART */
 
 /* The image, plus a byte-per-address map of which locations a file or the
  * far end actually gave us. present[] is what lets a sparse Intel hex file
