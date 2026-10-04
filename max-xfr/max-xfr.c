@@ -492,8 +492,6 @@ static int send_batch(char **files, int nfiles)
   int any_ok = 0, any_err = 0, fatal = 0;
   uint8_t sync = 0x55;
 
-  clock_gettime(CLOCK_MONOTONIC, &start);
-
   if (write_all(&sync, 1) < 0) return -1;
   if (read_expected_byte("handshake ack", 0xaa) < 0) return -1;
 
@@ -545,6 +543,10 @@ static int send_batch(char **files, int nfiles)
       fprintf(stderr, "\nSending %s (%lu bytes)...\n", base,
         (unsigned long)st.st_size);
     }
+
+    /* Reset statistics for each file */
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    bdone = 0;
 
     if (send_chunk(hdr, hdrlen) < 0) {
       fclose(fp);
@@ -623,8 +625,6 @@ static int receive_batch(const char *dest_arg, int dest_is_dir)
   char destpath[HOST_PATH_MAX];
   uint32_t cur_size;
   uint8_t buf[BLOCK_BUF_LEN];
-
-  clock_gettime(CLOCK_MONOTONIC, &start);
 
   if (write_all(&ack, 1) < 0) return -1;
   if (read_expected_byte("handshake sync", 0x55) < 0) return -1;
@@ -708,6 +708,10 @@ static int receive_batch(const char *dest_arg, int dest_is_dir)
         } else if (verbose) {
           fprintf(stderr, "\nReceiving %s (%lu bytes)...\n", destpath,
             (unsigned long)cur_size);
+
+          /* Reset statistics for each file */
+          clock_gettime(CLOCK_MONOTONIC, &start);
+          bdone = 0;
         }
       }
 
@@ -932,8 +936,20 @@ int main(int argc, char **argv)
     }
 
     if (verbose) {
-      fprintf(stderr, _("Receiving into %s\n\n"),
-        dest_arg ? dest_arg : "the current directory");
+      if (dest_arg != NULL) {
+        if (dest_is_dir) {
+          fprintf(stderr, _("Receiving into directory %s\n\n"), dest_arg);
+        } else {
+          fprintf(stderr, _("Receiving into file %s\n\n"), dest_arg);
+        }
+      } else {
+        char cwd[HOST_PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd)) != NULL) {
+          fprintf(stderr, _("Receiving into %s\n\n"), cwd);
+        } else {
+          fprintf(stderr, _("Receiving into the current directory\n\n"));
+        }
+      }
       fflush(stderr);
     }
     ret = receive_batch(dest_arg, dest_is_dir);
