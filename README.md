@@ -125,8 +125,14 @@ The ms folder contains the source code for the savebin subroutine, along with a 
 
 The loadbin and savebin functions are included as part of the MAX Monitor program (https://github.com/arhefner/Elf-maxmon/tree/main), which contains standard vector entry points to allow them to be called from user software.
 ## Elf/OS
-The ELfos folder contains a pair of file transfer utilities for Elf/OS.
+The Elfos folder contains a pair of file transfer utilities for Elf/OS. They speak the same protocol as ELF-DOS's `MR`/`MS` and take the same arguments, so they are used with max-xfr in the same way.
 
-The **mr** program is used to receive a file from another machine. It takes a single argument, which is the name of the file to be received. This is the Elf/OS name for the file; it does not need to be the same as the name of the file on the source machine.
+**mr [-u|-b] [-v] [** *destination* **]**
 
-The **ms** program is used to send a file from Elf/OS to another machine. It takes a single argument, which is the name of the file to be sent.
+The **mr** program receives files from another machine, and is the far end of `max-xfr -s`. With no destination, every file the host sends is saved under its own name in the current directory. A destination that is an existing directory saves them there instead. Any other destination is taken as a filename: only the first file the host sends is saved, under that name, and any others are read and discarded so that the session still ends cleanly. A file whose name Elf/OS will not accept, or which is the name of an existing directory, is discarded in the same way and counted as failed.
+
+**ms [-u|-b] [-v]** *filename* **[** *filename* **...]**
+
+The **ms** program sends files to another machine, and is the far end of `max-xfr -r`. Each filename may use the wildcards `*` and `?` in its last part, which then stands for every matching file in that directory other than hidden files and directories. A file that cannot be opened is counted as failed and the rest are still sent.
+
+Both use the console port unless told otherwise: `-u` uses the UART (`f_uread`/`f_utype`) and `-b` the bit-banged port (`f_bread`/`f_btype`), for a BIOS that provides them. Both print a count of files when the session is over, and nothing before that unless `-v` is given. Since the console is normally the same wire as the transfer, anything printed during it would be taken by the host as part of the protocol, so `-v` is only for when the transfer is on a different port from the console.
