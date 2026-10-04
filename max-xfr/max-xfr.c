@@ -112,7 +112,11 @@ static unsigned long bdone = 0;
 static struct termios orig_termios;  /* TERMinal I/O Structure */
 static int ttyfd = STDIN_FILENO;     /* STDIN_FILENO is 0 by default */
 
-static int delay = 200;              /* Default value for 57.6k hw UART */
+/* No delay by default: mr's receive loop keeps up with back-to-back bytes
+ * at 57600 baud on a hardware UART (about 140us a byte at 4MHz, against a
+ * byte time of 174us). A bit-banged port, a slower clock, a higher baud rate
+ * or an mr from before that loop was written all need -d. */
+static int delay = 0;
 
 /*
  *	Show the up/download statistics.
@@ -772,8 +776,8 @@ Usage: max-xfr -s [-v] [-d <delay>] <file> [file...]\n\
             otherwise\n\
        -v:  verbose (statistics and per-file progress on stderr)\n\
        -d:  delay in microseconds between bytes while sending, and\n\
-            before each ack byte while receiving (needed on some\n\
-            bit-banged links -- see the ack-pacing comments in\n\
+            before each ack byte while receiving (default 0; needed\n\
+            on bit-banged links -- see the ack-pacing comments in\n\
             send_chunk_ack()/recv_chunk() for why)\n");
   exit(1);
 }
