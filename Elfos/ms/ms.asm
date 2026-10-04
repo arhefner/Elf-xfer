@@ -422,28 +422,58 @@ sferr:      mov   rd,nerr
             db    '.',13,10,0
 sfret:      rtn
 
-sfopen:     mov   r8,0                  ; seek to the end to get the size
-            mov   r7,0
-            mov   rc,SEEK_END
+            ; The host is told the size ahead of the data, and the only
+            ; way to find it that can be relied on is to read the file
+            ; through. It is then opened again to start from the beginning.
+
+sfopen:     mov   rd,size
+            ldi   0
+            str   rd
+            inc   rd
+            str   rd
+            inc   rd
+            str   rd
+            inc   rd
+            str   rd
+
+sfcount:    mov   rf,buf
+            mov   rc,512
             mov   rd,fildes
-            call  o_seek
-            mov   rd,size
-            ghi   r8
+            call  o_read
+            lbdf  sfbad
+            ghi   rc
+            lbnz  sfadd
+            glo   rc
+            lbz   sfagain
+sfadd:      mov   rd,size+3
+            sex   rd
+            glo   rc
+            add
+            stxd
+            ghi   rc
+            adc
+            stxd
+            ldi   0
+            adc
+            stxd
+            ldi   0
+            adc
             str   rd
-            inc   rd
-            glo   r8
-            str   rd
-            inc   rd
-            ghi   r7
-            str   rd
-            inc   rd
-            glo   r7
-            str   rd
-            mov   r8,0                  ; and back to the start
-            mov   r7,0
-            mov   rc,SEEK_SET
+            sex   r2
+            lbr   sfcount
+
+sfbad:      mov   rd,fildes
+            call  o_close
+            lbr   sferr
+
+sfagain:    mov   rd,fildes
+            call  o_close
+            mov   rf,path
             mov   rd,fildes
-            call  o_seek
+            ldi   FF_READ
+            plo   r7
+            call  o_open
+            lbdf  sferr
 
             ; The handshake is left until there is a file to send, so that
             ; a mistyped name does not start a session with the host.
@@ -708,10 +738,15 @@ prrem:      adi   10+'0'
 
             ; Every byte of the transfer goes through these, apart from
             ; the data itself. The addresses are changed by -u and -b.
+            ; f_type is always called with the byte in D, never jumped
+            ; to: what a BIOS does with the byte on the way in is its own
+            ; business, and a call is the only thing they all agree on.
 
-getbyte:    lbr   f_read
+getbyte:    call  f_read
+            rtn
 
-putbyte:    lbr   f_type
+putbyte:    call  f_type
+            rtn
 
 
             .align page

@@ -528,11 +528,19 @@ prnext:     dec   r8
 
             ; Every byte of the transfer goes through these, apart from
             ; the data itself. The addresses are changed by -u and -b.
+            ; f_type is always called with the byte in D, never jumped
+            ; to: what a BIOS does with the byte on the way in is its own
+            ; business, and a call is the only thing they all agree on.
 
-getbyte:    lbr   f_read
+getbyte:    call  f_read
+            rtn
+
+putbyte:    call  f_type
+            rtn
 
 sendack:    ldi   0aah
-putbyte:    lbr   f_type
+            call  putbyte
+            rtn
 
 
             .align page
