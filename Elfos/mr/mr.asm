@@ -171,7 +171,7 @@ session:    mov   rd,savere
             phi   re
 
             call  scrtchk               ; see how this BIOS stacks R6
-chkret:
+
             call  getbyte
             xri   55h
             lbz   shake
@@ -393,28 +393,28 @@ usage:      call  o_inmsg
 
 
             ; Find out which half of R6 the BIOS pushes first on a call,
-            ; which the loop that reads data needs to know. In scrtlook
-            ; the last thing on the stack is the R6 of scrtchk, which is
-            ; where it returns to, chkret. Whichever half of that is on
-            ; top was pushed last. If the two halves are equal then the
-            ; order does not matter.
+            ; which the loop that reads data needs to know. A call is made
+            ; with R6 holding 00FFh, and scrtlook hands back whichever half
+            ; is then on top of the stack, the one pushed last. 00FFh is
+            ; only a value to recognize: the call saves it and the return
+            ; puts it back.
 
-scrtchk:    call  scrtlook
-            rtn
-
-scrtlook:   mov   rf,r2
-            inc   rf
-            ldn   rf
-            xri   low chkret
-            lbz   hifirst
-            rtn                         ; low half first, as order has it
-
-hifirst:    mov   rd,order
+scrtchk:    push  r6
+            mov   r6,00ffh
+            call  scrtlook
+            lbz   lofirst               ; low half first, as order has it
+            mov   rd,order
             ldi   high readret
             str   rd
             inc   rd
             ldi   low readret
             str   rd
+lofirst:    pop   r6
+            rtn
+
+scrtlook:   mov   rf,r2
+            inc   rf
+            ldn   rf
             rtn
 
 
