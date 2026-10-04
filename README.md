@@ -66,7 +66,7 @@ A nonzero `-o` on receive patches an existing file in place rather than truncati
 Numbers accept a `0x` prefix or an `h` suffix for hex; bare digits are decimal. (The monitor itself reads bare numbers as hex, but quietly turning `-l 1000` into 4096 bytes is worse than asking for one character of punctuation.)
 
 #### Delay
-`-d` works exactly as it does in max-xfr, except that it defaults to 200 microseconds rather than none, since the monitor's `loadbin` takes longer over each byte than a byte lasts at 57600 baud. It is there for the same reason: a bit-banged UART on the 1802 side has no hold register, so the CPU must already be polling for a start bit at the instant it arrives or the byte is lost outright. Start around 500-1000 microseconds for a bit-banged link; a hardware UART often needs little or none. Note that the delay goes *after* each byte mem-xfr originates, but *before* each echo or ack it sends in reply -- those are two opposite races, and both are real. (There is no `-b` or `-u` here; those are options on the ELF-DOS side, selecting which UART that end uses.)
+`-d` works exactly as it does in max-xfr, defaulting to none, and for the same reason: a bit-banged UART on the 1802 side has no hold register, so the CPU must already be polling for a start bit at the instant it arrives or the byte is lost outright. Start around 500-1000 microseconds for a bit-banged link. A hardware UART needs none, as `loadbin` reads block data straight from the UART. Note that the delay goes *after* each byte mem-xfr originates, but *before* each echo or ack it sends in reply -- those are two opposite races, and both are real. (There is no `-b` or `-u` here; those are options on the ELF-DOS side, selecting which UART that end uses.)
 
 ### Options
 ```

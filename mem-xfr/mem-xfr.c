@@ -112,7 +112,10 @@ static unsigned long bdone = 0;
 static struct termios orig_termios;  /* TERMinal I/O Structure */
 static int ttyfd = STDIN_FILENO;     /* STDIN_FILENO is 0 by default */
 
-static int delay = 200;              /* Default value for 57.6k hw UART */
+/* No delay by default: with the console on a hardware UART, loadbin reads
+ * block data straight from the port and keeps up with back-to-back bytes.
+ * A bit-banged console still needs -d. */
+static int delay = 0;
 
 /* The image, plus a byte-per-address map of which locations a file or the
  * far end actually gave us. present[] is what lets a sparse Intel hex file
