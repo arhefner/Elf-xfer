@@ -88,7 +88,7 @@ setio:      mov   rd,getbyte+1          ; point the transfer at that port
             inc   rd
             glo   r8
             str   rd
-            mov   rd,readlp+1
+            mov   rd,readjmp+1
             ghi   r8
             str   rd
             inc   rd
@@ -170,6 +170,8 @@ session:    mov   rd,savere
             ani   0feh                  ; turn off echo
             phi   re
 
+            call  scrtchk               ; see how this BIOS stacks R6
+chkret:
             call  getbyte
             xri   55h
             lbz   shake
@@ -390,6 +392,32 @@ usage:      call  o_inmsg
             rtn                         ; and return to os
 
 
+            ; Find out which half of R6 the BIOS pushes first on a call,
+            ; which the loop that reads data needs to know. In scrtlook
+            ; the last thing on the stack is the R6 of scrtchk, which is
+            ; where it returns to, chkret. Whichever half of that is on
+            ; top was pushed last. If the two halves are equal then the
+            ; order does not matter.
+
+scrtchk:    call  scrtlook
+            rtn
+
+scrtlook:   mov   rf,r2
+            inc   rf
+            ldn   rf
+            xri   low chkret
+            lbz   hifirst
+            rtn                         ; low half first, as order has it
+
+hifirst:    mov   rd,order
+            ldi   high readret
+            str   rd
+            inc   rd
+            ldi   low readret
+            str   rd
+            rtn
+
+
             ; Restore previous echo setting
 
 echoon:     mov   rd,savere
@@ -582,12 +610,33 @@ rbread:     call  sendack
             mov   rc,r7
             dec   rc                    ; adjust loop count
 
-readlp:     call  f_read
+            ; A call for each byte takes longer than the byte does at the
+            ; higher baud rates, so the read routine is jumped to instead,
+            ; after doing the part of a call that its return depends on:
+            ; R6 is where to come back to, with a copy of that on the stack
+            ; for the return to load back into R6. The two halves of the
+            ; copy go on in the order that scrtchk found the BIOS to use.
 
-            str   rf
+            push  r6                    ; our own return address
+            mov   rd,order
+            lda   rd
+            plo   r8
+            ldn   rd
+            phi   r8
+            mov   r6,readret
+
+readlp:     glo   r8
+            stxd
+            ghi   r8
+            stxd
+readjmp:    lbr   f_read                ; changed by -u and -b
+
+readret:    str   rf
             inc   rf
 
             untl  rc,readlp
+
+            pop   r6
 
             ldi   0                     ; terminate, in case it is a name
             str   rf
@@ -611,6 +660,8 @@ nerr:       db    0                     ; files that could not be created
 nskip:      db    0                     ; files ignored
 savere:     db    0
 count:      dw    0                     ; length of the chunk in buf
+order:      db    low readret           ; readret, as the BIOS stacks it
+            db    high readret
 nameat:     dw    0                     ; where a name goes in destpath
 slash:      dw    0                     ; set by chkdir
 sizeat:     dw    0                     ; where the size is in a header
